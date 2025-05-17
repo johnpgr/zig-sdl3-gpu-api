@@ -161,6 +161,18 @@ pub fn loadShader(gpu_device: *c.SDL_GPUDevice, comptime path: []const u8, stage
     };
 }
 
+pub fn convertSurfacePixelFormat(surface: *c.SDL_Surface, pixel_format: c.SDL_PixelFormat) !void {
+    if (surface.*.format != pixel_format) {
+        const converted = c.SDL_ConvertSurface(surface, pixel_format) orelse {
+            c.SDL_LogError(c.SDL_LOG_CATEGORY_APPLICATION, "Failed to convert image: %s", c.SDL_GetError());
+            return error.SurfaceConversionFailed;
+        };
+        const old_surface = surface.*;
+        surface.* = converted.*;
+        c.SDL_DestroySurface(&old_surface);
+    }
+}
+
 pub fn loadTexture(device: *c.SDL_GPUDevice, comptime path: []const u8) !*c.SDL_GPUTexture {
     var surface = c.IMG_Load(@ptrCast(path)) orelse {
         c.SDL_LogError(c.SDL_LOG_CATEGORY_APPLICATION, "Failed to load image: %s", c.SDL_GetError());
@@ -169,12 +181,7 @@ pub fn loadTexture(device: *c.SDL_GPUDevice, comptime path: []const u8) !*c.SDL_
     defer c.SDL_DestroySurface(surface);
 
     if (surface.*.format != c.SDL_PIXELFORMAT_RGBA8888) {
-        const converted = c.SDL_ConvertSurface(surface, c.SDL_PIXELFORMAT_RGBA8888) orelse {
-            c.SDL_LogError(c.SDL_LOG_CATEGORY_APPLICATION, "Failed to convert image: %s", c.SDL_GetError());
-            return error.TextureConversionFailed;
-        };
-        c.SDL_DestroySurface(surface);
-        surface = converted;
+        try convertSurfacePixelFormat(&surface, c.SDL_PIXELFORMAT_RGBA8888);
     }
 
     const create_info: c.SDL_GPUTextureCreateInfo = .{
@@ -197,25 +204,44 @@ pub fn loadTexture(device: *c.SDL_GPUDevice, comptime path: []const u8) !*c.SDL_
     };
     errdefer c.SDL_ReleaseGPUTexture(device, texture);
 
-    const transfer_size: u32 = @intCast(surface.*.pitch * surface.*.h);
+    const texture_data_size: u32 = @intCast(surface.*.pitch * surface.*.h);
     const transfer_info: c.SDL_GPUTransferBufferCreateInfo = .{
         .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
-        .size = transfer_size,
+        .size = texture_data_size,
         .props = 0,
     };
     const transfer_buffer = c.SDL_CreateGPUTransferBuffer(device, &transfer_info) orelse {
         c.SDL_LogError(c.SDL_LOG_CATEGORY_APPLICATION, "Failed to create transfer buffer: %s", c.SDL_GetError());
         return error.TransferBufferCreationFailed;
     };
+    defer c.SDL_ReleaseGPUTransferBuffer(device, transfer_buffer);
     const mapped_data = c.SDL_MapGPUTransferBuffer(device, transfer_buffer, false) orelse {
         c.SDL_LogError(c.SDL_LOG_CATEGORY_APPLICATION, "Failed to map transfer buffer: %s", c.SDL_GetError());
         return error.TransferBufferMappingFailed;
     };
-    const dst_ptr: [*]u8 = @ptrCast(mapped_data);
-    const src_ptr: [*]const u8 = @ptrCast(surface.*.pixels);
-    std.mem.copyForwards(u8, dst_ptr[0..transfer_size], src_ptr[0..transfer_size]);
+    const texture_data = @as([*]u8, @ptrCast(mapped_data))[0..texture_data_size];
+    const source_data = @as([*]const u8, @ptrCast(surface.*.pixels))[0..texture_data_size];
+    std.mem.copyForwards(u8, texture_data, source_data);
     c.SDL_UnmapGPUTransferBuffer(device, transfer_buffer);
 
+    try uploadTextureData(
+        device,
+        transfer_buffer,
+        texture,
+        @intCast(surface.*.w),
+        @intCast(surface.*.h),
+    );
+
+    return texture;
+}
+
+fn uploadTextureData(
+    device: *c.SDL_GPUDevice,
+    transfer_buffer: *c.SDL_GPUTransferBuffer,
+    texture: *c.SDL_GPUTexture,
+    width: u32,
+    height: u32,
+) !void {
     const cmd_buffer = c.SDL_AcquireGPUCommandBuffer(device) orelse {
         c.SDL_LogError(c.SDL_LOG_CATEGORY_APPLICATION, "Failed to acquire command buffer: %s", c.SDL_GetError());
         return error.CommandBufferAcquisitionFailed;
@@ -226,11 +252,11 @@ pub fn loadTexture(device: *c.SDL_GPUDevice, comptime path: []const u8) !*c.SDL_
         return error.CopyPassBeginFailed;
     };
 
-    const transfer_info2: c.SDL_GPUTextureTransferInfo = .{
+    const transfer_info: c.SDL_GPUTextureTransferInfo = .{
         .transfer_buffer = transfer_buffer,
         .offset = 0,
-        .pixels_per_row = @intCast(surface.*.w),
-        .rows_per_layer = @intCast(surface.*.h),
+        .pixels_per_row = width,
+        .rows_per_layer = height,
     };
 
     const texture_region: c.SDL_GPUTextureRegion = .{
@@ -240,18 +266,16 @@ pub fn loadTexture(device: *c.SDL_GPUDevice, comptime path: []const u8) !*c.SDL_
         .x = 0,
         .y = 0,
         .z = 0,
-        .w = @intCast(surface.*.w),
-        .h = @intCast(surface.*.h),
+        .w = width,
+        .h = height,
         .d = 1,
     };
 
-    c.SDL_UploadToGPUTexture(copy_pass, &transfer_info2, &texture_region, false);
+    c.SDL_UploadToGPUTexture(copy_pass, &transfer_info, &texture_region, false);
     c.SDL_EndGPUCopyPass(copy_pass);
 
     if (!c.SDL_SubmitGPUCommandBuffer(cmd_buffer)) {
         c.SDL_LogError(c.SDL_LOG_CATEGORY_APPLICATION, "Failed to submit command buffer");
         return error.CommandBufferSubmissionFailed;
     }
-
-    return texture;
 }
