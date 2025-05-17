@@ -48,19 +48,21 @@ pub fn gpu_render(window: *c.SDL_Window, gpu: *c.SDL_GPUDevice, pipeline: *c.SDL
     )) {
         return error.SwapchainAcquisitionFailed;
     }
+
+    const color_target_info: c.SDL_GPUColorTargetInfo = .{
+        .texture = swapchain_texture,
+        .load_op = c.SDL_GPU_LOADOP_CLEAR,
+        .clear_color = .{
+            .r = 0.3,
+            .g = 0.0,
+            .b = 0.3,
+            .a = 1.0,
+        },
+        .store_op = c.SDL_GPU_STOREOP_STORE,
+    };
     const render_pass = c.SDL_BeginGPURenderPass(
         cmd_buffer,
-        &.{
-            .texture = swapchain_texture,
-            .load_op = c.SDL_GPU_LOADOP_CLEAR,
-            .clear_color = .{
-                .r = 0.3,
-                .g = 0.0,
-                .b = 0.3,
-                .a = 1.0,
-            },
-            .store_op = c.SDL_GPU_STOREOP_STORE,
-        },
+        &color_target_info,
         1,
         null,
     ) orelse {
