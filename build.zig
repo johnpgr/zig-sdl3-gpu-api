@@ -1,6 +1,5 @@
 const std = @import("std");
 
-const glslc_path = "glslc"; // Uses glslc from PATH
 
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
@@ -11,6 +10,7 @@ pub fn build(b: *std.Build) void {
     // means any target is allowed, and the default is native. Other options
     // for restricting supported target set are available.
     const target = b.standardTargetOptions(.{});
+    const target_os = target.result.os.tag;
 
     // Standard optimization options allow the person running `zig build` to select
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
@@ -26,7 +26,7 @@ pub fn build(b: *std.Build) void {
 
     // Create shader compilation steps
     const vertex_shader = b.addSystemCommand(&.{
-        glslc_path,
+        "glslc",
         "src/assets/shaders/quad.vert",
         "-o",
         "src/assets/shaders/compiled/quad.vert.spv",
@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) void {
     vertex_shader.step.dependOn(&make_shader_dir.step);
 
     const fragment_shader = b.addSystemCommand(&.{
-        glslc_path,
+        "glslc",
         "src/assets/shaders/quad.frag",
         "-o",
         "src/assets/shaders/compiled/quad.frag.spv",
@@ -52,17 +52,50 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    exe_mod.linkSystemLibrary("SDL3", .{});
-    exe_mod.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
-    exe_mod.addIncludePath(.{ .cwd_relative = "/usr/local/include" });
-    exe_mod.linkSystemLibrary("vulkan", .{});
-
     // This creates another `std.Build.Step.Compile`, but this one builds an executable
     // rather than a static library.
     const exe = b.addExecutable(.{
         .name = "zig_sdl3_gpu_api",
         .root_module = exe_mod,
     });
+
+    switch (target_os) {
+        .macos => {
+            exe.linkSystemLibrary("SDL3");
+            exe.linkSystemLibrary("vulkan");
+            exe.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
+            exe.addIncludePath(.{ .cwd_relative = "/usr/local/include" });
+        },
+        .linux => {
+            exe.linkLibC();
+            exe.linkSystemLibrary("SDL3");
+            exe.linkSystemLibrary("vulkan");
+        },
+        .windows => {
+            if(optimize != .Debug) {
+                exe.subsystem = .Windows;
+            }
+
+            exe.linkLibC();
+            exe.linkSystemLibrary("SDL3");
+            exe.linkSystemLibrary("vulkan-1");
+            
+            // Add library paths for Windows
+            exe.addLibraryPath(.{ .cwd_relative = "lib/sdl3/windows/x64" });
+            exe.addLibraryPath(.{ .cwd_relative = "lib/vulkan/windows/x64" });
+
+            // Copy SDL3.dll to output (Vulkan DLL comes from system)
+            const sdl_dll_dep = b.addInstallBinFile(
+                b.path("lib/sdl3/windows/x64/SDL3.dll"),
+                "SDL3.dll",
+            );
+            exe.step.dependOn(&sdl_dll_dep.step);
+        },
+        else => {
+            std.log.debug("Unsupported target OS: {}", .{target_os});
+            return;
+        },
+    }
 
     // Make the executable depend on shader compilation
     exe.step.dependOn(&vertex_shader.step);
