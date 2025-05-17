@@ -62,6 +62,7 @@ pub fn build(b: *std.Build) void {
     switch (target_os) {
         .macos => {
             exe.linkSystemLibrary("SDL3");
+            exe.linkSystemLibrary("SDL3_image");
             exe.linkSystemLibrary("vulkan");
             exe.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
             exe.addIncludePath(.{ .cwd_relative = "/usr/local/include" });
@@ -78,18 +79,30 @@ pub fn build(b: *std.Build) void {
 
             exe.linkLibC();
             exe.linkSystemLibrary("SDL3");
+            exe.linkSystemLibrary("SDL3_image");
+            exe.linkSystemLibrary("SDL3_ttf");
             exe.linkSystemLibrary("vulkan-1");
             
-            // Add library paths for Windows
-            exe.addLibraryPath(.{ .cwd_relative = "lib/sdl3/windows/x64" });
-            exe.addLibraryPath(.{ .cwd_relative = "lib/vulkan/windows/x64" });
+            exe.addLibraryPath(.{ .cwd_relative = "thirdparty/SDL3_3.2.14-win32-x64/" });
+            exe.addLibraryPath(.{ .cwd_relative = "thirdparty/SDL3_image-3.2.4-win32-x64/" });
+            exe.addLibraryPath(.{ .cwd_relative = "thirdparty/SDL3_ttf-3.2.2-win32-x64/" });
+            exe.addLibraryPath(.{ .cwd_relative = "thirdparty/Vulkan_1.4.313.0-win32-x64/" });
 
-            // Copy SDL3.dll to output (Vulkan DLL comes from system)
             const sdl_dll_dep = b.addInstallBinFile(
-                b.path("lib/sdl3/windows/x64/SDL3.dll"),
+                b.path("thirdparty/SDL3_3.2.14-win32-x64/SDL3.dll"),
                 "SDL3.dll",
             );
+            const sdl_image_dll_dep = b.addInstallBinFile(
+                b.path("thirdparty/SDL3_image-3.2.4-win32-x64/SDL3_image.dll"),
+                "SDL3_image.dll",
+            );
+            const sdl_ttf_dll_dep = b.addInstallBinFile(
+                b.path("thirdparty/SDL3_ttf-3.2.2-win32-x64/SDL3_ttf.dll"),
+                "SDL3_ttf.dll",
+            );
             exe.step.dependOn(&sdl_dll_dep.step);
+            exe.step.dependOn(&sdl_image_dll_dep.step);
+            exe.step.dependOn(&sdl_ttf_dll_dep.step);
         },
         else => {
             std.log.debug("Unsupported target OS: {}", .{target_os});
