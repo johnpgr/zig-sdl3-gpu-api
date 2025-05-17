@@ -70,6 +70,8 @@ pub fn build(b: *std.Build) void {
         .linux => {
             exe.linkLibC();
             exe.linkSystemLibrary("SDL3");
+            exe.linkSystemLibrary("SDL3_image");
+            exe.linkSystemLibrary("SDL3_ttf");
             exe.linkSystemLibrary("vulkan");
         },
         .windows => {
