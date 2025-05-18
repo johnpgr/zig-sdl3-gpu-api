@@ -21,23 +21,23 @@ pub fn build(b: *std.Build) void {
     const make_shader_dir = b.addSystemCommand(&.{
         "mkdir",
         "-p",
-        "src/assets/shaders/compiled",
+        "assets/shaders/compiled",
     });
 
     // Create shader compilation steps
     const vertex_shader = b.addSystemCommand(&.{
         "glslc",
-        "src/assets/shaders/quad.vert",
+        "assets/shaders/quad.vert",
         "-o",
-        "src/assets/shaders/compiled/quad.vert.spv",
+        "assets/shaders/compiled/quad.vert.spv",
     });
     vertex_shader.step.dependOn(&make_shader_dir.step);
 
     const fragment_shader = b.addSystemCommand(&.{
         "glslc",
-        "src/assets/shaders/quad.frag",
+        "assets/shaders/quad.frag",
         "-o",
-        "src/assets/shaders/compiled/quad.frag.spv",
+        "assets/shaders/compiled/quad.frag.spv",
     });
     fragment_shader.step.dependOn(&make_shader_dir.step);
 

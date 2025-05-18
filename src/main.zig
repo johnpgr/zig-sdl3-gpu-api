@@ -8,7 +8,7 @@ const c = @cImport({
 
 pub var running = true;
 
-pub fn process_events(window: *c.SDL_Window) void {
+pub fn processEvents(window: *c.SDL_Window) void {
     _ = window;
     var event: c.SDL_Event = undefined;
     while (c.SDL_PollEvent(&event)) {
@@ -33,7 +33,7 @@ pub fn process_events(window: *c.SDL_Window) void {
 
 pub fn update() void {}
 
-pub fn gpu_render(window: *c.SDL_Window, gpu: *c.SDL_GPUDevice, pipeline: *c.SDL_GPUGraphicsPipeline) !void {
+pub fn render(window: *c.SDL_Window, gpu: *c.SDL_GPUDevice, pipeline: *c.SDL_GPUGraphicsPipeline) !void {
     const cmd_buffer = c.SDL_AcquireGPUCommandBuffer(gpu) orelse {
         return error.CommandBufferAcquisitionFailed;
     };
@@ -79,65 +79,93 @@ pub fn gpu_render(window: *c.SDL_Window, gpu: *c.SDL_GPUDevice, pipeline: *c.SDL
 }
 
 pub fn main() !void {
-    _ = c.SDL_Init(c.SDL_INIT_VIDEO);
+    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
+        c.SDL_LogError(c.SDL_LOG_CATEGORY_APPLICATION, "SDL_Init failed: %s", c.SDL_GetError());
+        return error.SDLInitializationFailed;
+    }
     defer c.SDL_Quit();
+
     c.SDL_SetLogPriorities(c.SDL_LOG_PRIORITY_VERBOSE);
 
-    const window = c.SDL_CreateWindow("Hello, SDL3", 1280, 720, 0) orelse {
-        return error.WindowCreationFailed;
-    };
-    defer c.SDL_DestroyWindow(window);
-
-    const gpu_device = c.SDL_CreateGPUDevice(
-        c.SDL_GPU_SHADERFORMAT_SPIRV,
+    const device = c.SDL_CreateGPUDevice(
+        c.SDL_GPU_SHADERFORMAT_SPIRV | c.SDL_GPU_SHADERFORMAT_DXIL | c.SDL_GPU_SHADERFORMAT_MSL,
         true,
         null,
     ) orelse {
         return error.DeviceCreationFailed;
     };
-    defer c.SDL_DestroyGPUDevice(gpu_device);
+    errdefer c.SDL_DestroyGPUDevice(device);
 
-    if (!c.SDL_ClaimWindowForGPUDevice(gpu_device, window)) {
+    const window = c.SDL_CreateWindow("Hello, SDL3", 1280, 720, 0) orelse {
+        return error.WindowCreationFailed;
+    };
+    errdefer c.SDL_DestroyWindow(window);
+
+    defer {
+        c.SDL_ReleaseWindowFromGPUDevice(device, window);
+        c.SDL_DestroyWindow(window);
+        c.SDL_DestroyGPUDevice(device);
+    }
+
+    if (!c.SDL_ClaimWindowForGPUDevice(device, window)) {
         return error.ClaimWindowFailed;
     }
 
-    const vertex_shader = try loadShader(
-        gpu_device,
+    var present_mode: c.SDL_GPUPresentMode = c.SDL_GPU_PRESENTMODE_VSYNC;
+    if (c.SDL_WindowSupportsGPUPresentMode(device, window, c.SDL_GPU_PRESENTMODE_IMMEDIATE)) {
+        present_mode = c.SDL_GPU_PRESENTMODE_IMMEDIATE;
+    } else if (c.SDL_WindowSupportsGPUPresentMode(device, window, c.SDL_GPU_PRESENTMODE_MAILBOX)) {
+        present_mode = c.SDL_GPU_PRESENTMODE_MAILBOX;
+    }
+
+    if (!c.SDL_SetGPUSwapchainParameters(device, window, c.SDL_GPU_SWAPCHAINCOMPOSITION_SDR, present_mode)) {
+        c.SDL_LogError(c.SDL_LOG_CATEGORY_APPLICATION, "Failed to set swapchain parameters: %s", c.SDL_GetError());
+        return error.SwapchainParametersFailed;
+    }
+
+    const vert_shader = try loadShader(
+        device,
         "assets/shaders/compiled/quad.vert.spv",
-        c.SDL_GPU_SHADERSTAGE_VERTEX,
+        0,
+        0,
+        0,
+        0,
     );
 
-    const fragment_shader = try loadShader(
-        gpu_device,
+    const frag_shader = try loadShader(
+        device,
         "assets/shaders/compiled/quad.frag.spv",
-        c.SDL_GPU_SHADERSTAGE_FRAGMENT,
+        0,
+        0,
+        0,
+        0,
     );
 
-    const gpu_pipeline = c.SDL_CreateGPUGraphicsPipeline(gpu_device, &.{
-        .vertex_shader = vertex_shader,
-        .fragment_shader = fragment_shader,
+    const pipeline = c.SDL_CreateGPUGraphicsPipeline(device, &.{
+        .vertex_shader = vert_shader,
+        .fragment_shader = frag_shader,
         .primitive_type = c.SDL_GPU_PRIMITIVETYPE_TRIANGLELIST,
         .target_info = .{
             .num_color_targets = 1,
             .color_target_descriptions = &.{
-                .format = c.SDL_GetGPUSwapchainTextureFormat(gpu_device, window),
+                .format = c.SDL_GetGPUSwapchainTextureFormat(device, window),
             },
         },
     }) orelse {
         c.SDL_LogError(c.SDL_LOG_CATEGORY_APPLICATION, "Pipeline creation failed %s", c.SDL_GetError());
         return error.PipelineCreationFailed;
     };
-    defer c.SDL_ReleaseGPUGraphicsPipeline(gpu_device, gpu_pipeline);
+    defer c.SDL_ReleaseGPUGraphicsPipeline(device, pipeline);
 
-    c.SDL_ReleaseGPUShader(gpu_device, vertex_shader);
-    c.SDL_ReleaseGPUShader(gpu_device, fragment_shader);
+    c.SDL_ReleaseGPUShader(device, vert_shader);
+    c.SDL_ReleaseGPUShader(device, frag_shader);
 
-    const sprite_atlas = try loadTexture(gpu_device, "src/assets/textures/SPRITE_ATLAS.png");
-    defer c.SDL_ReleaseGPUTexture(gpu_device, sprite_atlas);
+    const sprite_atlas = try loadTexture(device, "assets/textures/SPRITE_ATLAS.png");
+    defer c.SDL_ReleaseGPUTexture(device, sprite_atlas);
 
     while (running) {
-        process_events(window);
-        gpu_render(window, gpu_device, gpu_pipeline) catch |err| {
+        processEvents(window);
+        render(window, device, pipeline) catch |err| {
             c.SDL_LogError(
                 c.SDL_LOG_CATEGORY_RENDER,
                 "Render error: %s",
@@ -147,29 +175,71 @@ pub fn main() !void {
     }
 }
 
-pub fn loadShader(gpu_device: *c.SDL_GPUDevice, comptime path: []const u8, stage: c.SDL_GPUShaderStage) !*c.SDL_GPUShader {
-    const shader_code = @embedFile(path);
+pub fn loadShader(
+    device: *c.SDL_GPUDevice,
+    comptime filepath: []const u8,
+    sampler_count: u32,
+    uniform_buffer_count: u32,
+    storage_buffer_count: u32,
+    storage_texture_count: u32,
+) !*c.SDL_GPUShader {
+    const stage: c.SDL_GPUShaderStage =
+        if (c.SDL_strstr(filepath.ptr, ".vert") != null)
+            c.SDL_GPU_SHADERSTAGE_VERTEX
+        else if (c.SDL_strstr(filepath.ptr, ".frag") != null)
+            c.SDL_GPU_SHADERSTAGE_FRAGMENT
+        else {
+            c.SDL_LogError(c.SDL_LOG_CATEGORY_APPLICATION, "Invalid shader stage for file: %s", &filepath);
+            return error.InvalidShaderStage;
+        };
 
-    return c.SDL_CreateGPUShader(gpu_device, &.{
-        .code = shader_code.ptr,
-        .code_size = shader_code.len,
-        .entrypoint = "main",
-        .format = c.SDL_GPU_SHADERFORMAT_SPIRV,
+    const backend_formats = c.SDL_GetGPUShaderFormats(device);
+    var format: c.SDL_GPUShaderFormat = c.SDL_GPU_SHADERFORMAT_INVALID;
+    var entrypoint: []const u8 = "main";
+
+    if (backend_formats & c.SDL_GPU_SHADERFORMAT_SPIRV != 0) {
+        format = c.SDL_GPU_SHADERFORMAT_SPIRV;
+    } else if (backend_formats & c.SDL_GPU_SHADERFORMAT_DXIL != 0) {
+        format = c.SDL_GPU_SHADERFORMAT_DXIL;
+    } else if (backend_formats & c.SDL_GPU_SHADERFORMAT_MSL != 0) {
+        format = c.SDL_GPU_SHADERFORMAT_MSL;
+        entrypoint = "main0";
+    } else {
+        c.SDL_LogError(c.SDL_LOG_CATEGORY_APPLICATION, "Unrecognized shader format for file: %s", &filepath);
+        return error.NoSupportedShaderFormats;
+    }
+
+    var code_size: usize = 0;
+    const code = c.SDL_LoadFile(filepath.ptr, &code_size) orelse {
+        c.SDL_LogError(c.SDL_LOG_CATEGORY_APPLICATION, "Failed to load shader file: %s", &filepath);
+        return error.ShaderFileLoadFailed;
+    };
+    defer c.SDL_free(code);
+
+    const create_info: c.SDL_GPUShaderCreateInfo = .{
+        .code = @ptrCast(code),
+        .code_size = code_size,
+        .entrypoint = entrypoint.ptr,
+        .format = format,
         .stage = stage,
-    }) orelse {
+        .num_samplers = sampler_count,
+        .num_uniform_buffers = uniform_buffer_count,
+        .num_storage_buffers = storage_buffer_count,
+        .num_storage_textures = storage_texture_count,
+    };
+    return c.SDL_CreateGPUShader(device, &create_info) orelse {
         return error.ShaderCreationFailed;
     };
 }
 
-pub fn convertSurfacePixelFormat(surface: *c.SDL_Surface, pixel_format: c.SDL_PixelFormat) !void {
-    if (surface.*.format != pixel_format) {
-        const converted = c.SDL_ConvertSurface(surface, pixel_format) orelse {
+pub fn convertSurfacePixelFormat(surface: *[*c]c.SDL_Surface, pixel_format: c.SDL_PixelFormat) !void {
+    if (surface.*.*.format != pixel_format) {
+        const converted = c.SDL_ConvertSurface(surface.*, pixel_format) orelse {
             c.SDL_LogError(c.SDL_LOG_CATEGORY_APPLICATION, "Failed to convert image: %s", c.SDL_GetError());
             return error.SurfaceConversionFailed;
         };
-        const old_surface = surface.*;
-        surface.* = converted.*;
-        c.SDL_DestroySurface(&old_surface);
+        c.SDL_DestroySurface(surface.*);
+        surface.* = converted;
     }
 }
 
