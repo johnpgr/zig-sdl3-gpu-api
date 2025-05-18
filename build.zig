@@ -1,6 +1,5 @@
 const std = @import("std");
 
-
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
 // runner.
@@ -17,29 +16,65 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
-    // // Ensure shader output directory exists
-    // const make_shader_dir = b.addSystemCommand(&.{
-    //     "mkdir",
-    //     "-p",
-    //     "assets/shaders/compiled",
-    // });
-    //
-    // // Create shader compilation steps
-    // const vertex_shader = b.addSystemCommand(&.{
-    //     "glslc",
-    //     "assets/shaders/quad.vert",
-    //     "-o",
-    //     "assets/shaders/compiled/quad.vert.spv",
-    // });
-    // vertex_shader.step.dependOn(&make_shader_dir.step);
-    //
-    // const fragment_shader = b.addSystemCommand(&.{
-    //     "glslc",
-    //     "assets/shaders/quad.frag",
-    //     "-o",
-    //     "assets/shaders/compiled/quad.frag.spv",
-    // });
-    // fragment_shader.step.dependOn(&make_shader_dir.step);
+    const shader_step = b.step("shaders", "Compile shaders");
+
+    const shader_source_dir = "assets/shaders/source";
+    const shader_out_dir = "assets/shaders/compiled";
+
+    const shader_types = [_]struct { extension: []const u8 }{
+        .{ .extension = ".vert.hlsl" },
+        .{ .extension = ".frag.hlsl" },
+        .{ .extension = ".comp.hlsl" },
+    };
+
+    const shader_output_formats = [_]struct {
+        extension: []const u8,
+    }{
+        .{ .extension = ".spv" },
+        .{ .extension = ".msl" },
+        .{ .extension = ".dxil" },
+    };
+
+    var shader_dir = std.fs.cwd().openDir(shader_source_dir, .{ .iterate = true }) catch |err| {
+        std.log.err("Failed to open shader directory: {}", .{err});
+        return;
+    };
+    defer shader_dir.close();
+
+    var shader_iter = shader_dir.iterate();
+
+    while (shader_iter.next() catch |err| {
+        std.log.err("Failed to iterate shader directory: {}", .{err});
+        return;
+    }) |entry| {
+        if (entry.kind != .file) continue;
+
+        // Check if file matches any shader extension
+        for (shader_types) |shader_input_type| {
+            if (std.mem.endsWith(u8, entry.name, shader_input_type.extension)) {
+                const output_file_basename = entry.name[0 .. entry.name.len - 5]; // Removes ".hlsl"
+
+                for (shader_output_formats) |output_format| {
+                    const shader_cmd = b.addSystemCommand(&.{
+                        "shadercross",
+                        entry.name, // input file e.g. quad.vert.hlsl
+                        "-o",
+                        b.fmt(
+                            "../{s}/{s}{s}", // e.g. ../compiled/SPIRV/quad.vert.spv
+                            .{
+                                std.fs.path.basename(shader_out_dir), // "compiled"
+                                output_file_basename, // "quad.vert"
+                                output_format.extension, // ".spv", ".msl", or ".dxil"
+                            },
+                        ),
+                    });
+                    shader_cmd.setCwd(b.path(shader_source_dir));
+                    shader_step.dependOn(&shader_cmd.step);
+                }
+                break; // Found matching input shader type, process next file
+            }
+        }
+    }
 
     // We will also create a module for our other entry point, 'main.zig'.
     const exe_mod = b.createModule(.{
@@ -59,52 +94,21 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
 
+    exe.linkLibC();
+    exe.linkSystemLibrary("SDL3");
+
     switch (target_os) {
-        .macos => {
-            exe.linkSystemLibrary("SDL3");
-            exe.linkSystemLibrary("SDL3_image");
-            exe.linkSystemLibrary("vulkan");
-            exe.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
-            exe.addIncludePath(.{ .cwd_relative = "/usr/local/include" });
-        },
-        .linux => {
-            exe.linkLibC();
-            exe.linkSystemLibrary("SDL3");
-            exe.linkSystemLibrary("SDL3_image");
-            exe.linkSystemLibrary("SDL3_ttf");
-            exe.linkSystemLibrary("vulkan");
-        },
+        .linux, .macos => {},
         .windows => {
-            if(optimize != .Debug) {
+            if (optimize != .Debug) {
                 exe.subsystem = .Windows;
             }
-
-            exe.linkLibC();
-            exe.linkSystemLibrary("SDL3");
-            exe.linkSystemLibrary("SDL3_image");
-            exe.linkSystemLibrary("SDL3_ttf");
-            exe.linkSystemLibrary("vulkan-1");
-            
             exe.addLibraryPath(.{ .cwd_relative = "thirdparty/SDL3_3.2.14-win32-x64/" });
-            exe.addLibraryPath(.{ .cwd_relative = "thirdparty/SDL3_image-3.2.4-win32-x64/" });
-            exe.addLibraryPath(.{ .cwd_relative = "thirdparty/SDL3_ttf-3.2.2-win32-x64/" });
-            exe.addLibraryPath(.{ .cwd_relative = "thirdparty/Vulkan_1.4.313.0-win32-x64/" });
-
             const sdl_dll_dep = b.addInstallBinFile(
                 b.path("thirdparty/SDL3_3.2.14-win32-x64/SDL3.dll"),
                 "SDL3.dll",
             );
-            const sdl_image_dll_dep = b.addInstallBinFile(
-                b.path("thirdparty/SDL3_image-3.2.4-win32-x64/SDL3_image.dll"),
-                "SDL3_image.dll",
-            );
-            const sdl_ttf_dll_dep = b.addInstallBinFile(
-                b.path("thirdparty/SDL3_ttf-3.2.2-win32-x64/SDL3_ttf.dll"),
-                "SDL3_ttf.dll",
-            );
             exe.step.dependOn(&sdl_dll_dep.step);
-            exe.step.dependOn(&sdl_image_dll_dep.step);
-            exe.step.dependOn(&sdl_ttf_dll_dep.step);
         },
         else => {
             std.log.debug("Unsupported target OS: {}", .{target_os});
@@ -112,14 +116,13 @@ pub fn build(b: *std.Build) void {
         },
     }
 
-    // Make the executable depend on shader compilation
-    // exe.step.dependOn(&vertex_shader.step);
-    // exe.step.dependOn(&fragment_shader.step);
-
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).
     b.installArtifact(exe);
+
+    // Make sure the executable is installed after the shader step
+    // b.getInstallStep().dependOn(shader_step);
 
     // This *creates* a Run step in the build graph, to be executed when another
     // step is evaluated that depends on it. The next line below will establish
