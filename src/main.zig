@@ -43,24 +43,16 @@ pub fn processEvents(window: *c.SDL_Window) void {
 }
 
 pub fn getGpuDeviceForRenderer(renderer: *c.SDL_Renderer) !*c.SDL_GPUDevice {
-    return @as(
-        *c.SDL_GPUDevice,
-        @ptrCast(c.SDL_GetPointerProperty(
-            c.SDL_GetRendererProperties(renderer),
-            c.SDL_PROP_RENDERER_GPU_DEVICE_POINTER,
-            null,
-        ) orelse {
-            return error.NoGPUDevice;
-        }),
-    );
+    return @as(*c.SDL_GPUDevice, @ptrCast(c.SDL_GetPointerProperty(
+        c.SDL_GetRendererProperties(renderer),
+        c.SDL_PROP_RENDERER_GPU_DEVICE_POINTER,
+        null,
+    ) orelse {
+        return error.NoGPUDevice;
+    }));
 }
 
 pub fn main() !void {
-    var context: Context = .{};
-    defer context.deinit();
-    var system: System = .{};
-    defer system.deinit(context.device);
-
     if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
         c.SDL_LogError(c.SDL_LOG_CATEGORY_APPLICATION, "SDL_Init failed: %s", c.SDL_GetError());
         return error.SDLInitializationFailed;
@@ -85,8 +77,6 @@ pub fn main() !void {
         c.SDL_Log("SDL_SetRenderVSync failed: %s", c.SDL_GetError());
         return error.VSyncFailed;
     }
-
-    c.SDL_srand(0);
 
     global_device = getGpuDeviceForRenderer(global_renderer) catch {
         c.SDL_Log("SDL_GetPointerProperty failed: %s", c.SDL_GetError());
@@ -162,7 +152,7 @@ pub fn loadTexture(
         c.SDL_LogError(c.SDL_LOG_CATEGORY_APPLICATION, "Couldn't load %s: %s", file_to_load, c.SDL_GetError());
         return error.LoadBMPFailed;
     };
-    defer c.SDL_DestroySurface(image_data);
+    defer c.SDL_FreeSurface(surface);
 
     // Set transparent pixel as the pixel at (0,0)
     if (transparent) {
