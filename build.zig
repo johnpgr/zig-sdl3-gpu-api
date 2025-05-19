@@ -17,29 +17,29 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
-    // Ensure shader output directory exists
-    const make_shader_dir = b.addSystemCommand(&.{
-        "mkdir",
-        "-p",
-        "assets/shaders/compiled",
-    });
-
-    // Create shader compilation steps
-    const vertex_shader = b.addSystemCommand(&.{
-        "glslc",
-        "assets/shaders/quad.vert",
-        "-o",
-        "assets/shaders/compiled/quad.vert.spv",
-    });
-    vertex_shader.step.dependOn(&make_shader_dir.step);
-
-    const fragment_shader = b.addSystemCommand(&.{
-        "glslc",
-        "assets/shaders/quad.frag",
-        "-o",
-        "assets/shaders/compiled/quad.frag.spv",
-    });
-    fragment_shader.step.dependOn(&make_shader_dir.step);
+    // // Ensure shader output directory exists
+    // const make_shader_dir = b.addSystemCommand(&.{
+    //     "mkdir",
+    //     "-p",
+    //     "assets/shaders/compiled",
+    // });
+    //
+    // // Create shader compilation steps
+    // const vertex_shader = b.addSystemCommand(&.{
+    //     "glslc",
+    //     "assets/shaders/quad.vert",
+    //     "-o",
+    //     "assets/shaders/compiled/quad.vert.spv",
+    // });
+    // vertex_shader.step.dependOn(&make_shader_dir.step);
+    //
+    // const fragment_shader = b.addSystemCommand(&.{
+    //     "glslc",
+    //     "assets/shaders/quad.frag",
+    //     "-o",
+    //     "assets/shaders/compiled/quad.frag.spv",
+    // });
+    // fragment_shader.step.dependOn(&make_shader_dir.step);
 
     // We will also create a module for our other entry point, 'main.zig'.
     const exe_mod = b.createModule(.{
@@ -113,8 +113,8 @@ pub fn build(b: *std.Build) void {
     }
 
     // Make the executable depend on shader compilation
-    exe.step.dependOn(&vertex_shader.step);
-    exe.step.dependOn(&fragment_shader.step);
+    // exe.step.dependOn(&vertex_shader.step);
+    // exe.step.dependOn(&fragment_shader.step);
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
