@@ -118,6 +118,7 @@ pub fn build(b: *std.Build) void {
 
     exe.linkLibC();
     exe.linkSystemLibrary("SDL3");
+    exe.linkSystemLibrary("SDL3_ttf");
 
     switch (target_os) {
         .linux, .macos => {},
