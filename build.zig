@@ -18,28 +18,9 @@ pub fn build(b: *std.Build) void {
 
     // Check if shadercross is available
     const has_shadercross = blk: {
-        const check_result = std.ChildProcess.run(.{
+        const check_result = std.process.Child.run(.{
             .allocator = b.allocator,
-            .argv = &[_][]const u8{"which", "shadercross"},
-            .cwd = ".",
-        }) catch |err| {
-            std.log.debug("Failed to check for shadercross: {}", .{err});
-            break :blk false;
-        };
-        defer {
-            b.allocator.free(check_result.stderr);
-            b.allocator.free(check_result.stdout);
-        }
-        break :blk check_result.term.Exited == 0;
-    };
-
-    const optimize = b.standardOptimizeOption(.{});
-
-    // Check if shadercross is available
-    const has_shadercross = blk: {
-        const check_result = std.ChildProcess.run(.{
-            .allocator = b.allocator,
-            .argv = &[_][]const u8{"which", "shadercross"},
+            .argv = &[_][]const u8{ "which", "shadercross" },
             .cwd = ".",
         }) catch |err| {
             std.log.debug("Failed to check for shadercross: {}", .{err});
@@ -116,33 +97,6 @@ pub fn build(b: *std.Build) void {
 
     // Make sure the executable is installed after the shader step
     b.getInstallStep().dependOn(shader_step);
-
-        // Check if file matches any shader extension
-        for (shader_types) |shader_input_type| {
-            if (std.mem.endsWith(u8, entry.name, shader_input_type.extension)) {
-                const output_file_basename = entry.name[0 .. entry.name.len - 5]; // Removes ".hlsl"
-
-                for (shader_output_formats) |output_format| {
-                    const shader_cmd = b.addSystemCommand(&.{
-                        "shadercross",
-                        entry.name, // input file e.g. quad.vert.hlsl
-                        "-o",
-                        b.fmt(
-                            "../{s}/{s}{s}", // e.g. ../compiled/SPIRV/quad.vert.spv
-                            .{
-                                std.fs.path.basename(shader_out_dir), // "compiled"
-                                output_file_basename, // "quad.vert"
-                                output_format.extension, // ".spv", ".msl", or ".dxil"
-                            },
-                        ),
-                    });
-                    shader_cmd.setCwd(b.path(shader_source_dir));
-                    shader_step.dependOn(&shader_cmd.step);
-                }
-                break; // Found matching input shader type, process next file
-            }
-        }
-    }
 
     // We will also create a module for our other entry point, 'main.zig'.
     const exe_mod = b.createModule(.{
