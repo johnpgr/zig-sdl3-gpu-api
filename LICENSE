@@ -4,8 +4,3 @@ this project includes the following third-party components:
   licensed under zlib license
   copyright (c) 1997-2024 sam lantinga <slouken@libsdl.org>
   https://github.com/libsdl-org/SDL/blob/main/LICENSE.txt
-
-- vulkan sdk components (lib/vulkan/windows/x64/vulkan-1.lib)
-  licensed under apache license 2.0
-  copyright (c) 2015-2024 the khronos group inc.
-  https://vulkan.lunarg.com/license
