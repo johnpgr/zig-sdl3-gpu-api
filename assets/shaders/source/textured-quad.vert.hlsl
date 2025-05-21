@@ -1,3 +1,4 @@
+[[vk::binding(0, 1)]] // Specify descriptor set 1
 cbuffer Projection : register(b0)
 {
     float4x4 u_projection;

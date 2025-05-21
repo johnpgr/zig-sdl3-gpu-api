@@ -2,7 +2,7 @@ const std = @import("std");
 const c = @cImport({
     @cDefine("SDL_DISABLE_OLDNAMES", {});
     @cInclude("SDL3/SDL.h");
-    @cInclude("SDL3_TTF/SDL_ttf.h");
+    @cInclude("SDL3_ttf/SDL_ttf.h");
 });
 
 const IMAGES_BASE_PATH = "assets/images/";
@@ -172,7 +172,6 @@ const Game = struct {
     sampler: *c.SDL_GPUSampler,
     sprite_data_transfer_buffer: *c.SDL_GPUTransferBuffer,
     sprite_data_buffer: *c.SDL_GPUBuffer,
-    text_texture: *c.SDL_GPUTexture,
     font: *c.TTF_Font,
     running: bool,
     paused: bool,
@@ -652,12 +651,12 @@ pub fn main() !void {
 
     while (game.running) {
         game.handleEvents();
-        // try game.render();
-        try game.renderText(
-            "Hello, World!",
-            10,
-            10,
-            .{ .a = 1, .r = 1, .g = 1, .b = 1 },
-        );
+        // try game.renderText(
+        //     "Hello, World!",
+        //     10,
+        //     10,
+        //     .{ .a = 1, .r = 1, .g = 1, .b = 1 },
+        // );
+        try game.render();
     }
 }
