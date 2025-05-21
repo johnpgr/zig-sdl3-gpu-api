@@ -9,6 +9,14 @@ const IMAGES_BASE_PATH = "assets/images/";
 const SPRITE_COUNT: u32 = 8192;
 const Matrix4x4 = [4][4]f32;
 
+pub const Vertex = struct {
+    x: f32,
+    y: f32,
+    z: f32,
+    colour: c.SDL_FColor,
+    uv: c.SDL_FPoint,
+};
+
 const SpriteInstance = packed struct {
     x: f32,
     y: f32,
@@ -168,6 +176,7 @@ const Game = struct {
     device: *c.SDL_GPUDevice,
     window: *c.SDL_Window,
     render_pipeline: *c.SDL_GPUGraphicsPipeline,
+    text_render_pipeline: *c.SDL_GPUGraphicsPipeline, // Added for text
     texture: *c.SDL_GPUTexture,
     sampler: *c.SDL_GPUSampler,
     sprite_data_transfer_buffer: *c.SDL_GPUTransferBuffer,
@@ -236,13 +245,26 @@ const Game = struct {
         c.SDL_srand(0);
 
         const render_pipeline = try setupGraphicsPipeline(device, window);
+        errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, render_pipeline);
+        const text_render_pipeline = try setupTextPipeline(device, window);
+        errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, text_render_pipeline);
+
         const texture_data = try setupTextureData(device);
+        errdefer {
+            c.SDL_ReleaseGPUSampler(device, texture_data.sampler);
+            c.SDL_ReleaseGPUTexture(device, texture_data.texture);
+        }
         const sprite_buffers = try setupSpriteBuffers(device);
+        errdefer {
+            c.SDL_ReleaseGPUBuffer(device, sprite_buffers.storage_buffer);
+            c.SDL_ReleaseGPUTransferBuffer(device, sprite_buffers.transfer_buffer);
+        }
 
         return Game{
             .device = device,
             .window = window,
             .render_pipeline = render_pipeline,
+            .text_render_pipeline = text_render_pipeline, // Store text pipeline
             .texture = texture_data.texture,
             .sampler = texture_data.sampler,
             .sprite_data_transfer_buffer = sprite_buffers.transfer_buffer,
@@ -259,6 +281,78 @@ const Game = struct {
         if (c.SDL_WindowSupportsGPUPresentMode(device, window, c.SDL_GPU_PRESENTMODE_IMMEDIATE))
             return c.SDL_GPU_PRESENTMODE_IMMEDIATE;
         return c.SDL_GPU_PRESENTMODE_VSYNC;
+    }
+
+    fn setupTextPipeline(device: *c.SDL_GPUDevice, window: *c.SDL_Window) !*c.SDL_GPUGraphicsPipeline {
+        const vertex_shader = try loadShader(device, "shader.vert", 0, 1, 0, 0); // Assuming 1 UBO for MVP
+        defer c.SDL_ReleaseGPUShader(device, vertex_shader);
+
+        const frag_shader = try loadShader(device, "shader.frag", 1, 0, 0, 0); // 1 sampler
+        defer c.SDL_ReleaseGPUShader(device, frag_shader);
+
+        const color_target_descriptions = [_]c.SDL_GPUColorTargetDescription{
+            .{
+                .format = c.SDL_GetGPUSwapchainTextureFormat(device, window),
+                .blend_state = .{
+                    .enable_blend = true,
+                    .alpha_blend_op = c.SDL_GPU_BLENDOP_ADD,
+                    .color_blend_op = c.SDL_GPU_BLENDOP_ADD,
+                    .color_write_mask = 0xF,
+                    .src_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_SRC_ALPHA,
+                    .dst_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_DST_ALPHA,
+                    .src_color_blendfactor = c.SDL_GPU_BLENDFACTOR_SRC_ALPHA,
+                    .dst_color_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+                },
+            },
+        };
+        const pipeline_crete_info = c.SDL_GPUGraphicsPipelineCreateInfo{
+            .target_info = .{
+                .num_color_targets = 1,
+                .color_target_descriptions = &color_target_descriptions,
+                .has_depth_stencil_target = false,
+                .depth_stencil_format = c.SDL_GPU_TEXTUREFORMAT_INVALID,
+            },
+            .vertex_input_state = .{
+                .num_vertex_buffers = 1,
+                .vertex_buffer_descriptions = &[_]c.SDL_GPUVertexBufferDescription{
+                    .{
+                        .slot = 0,
+                        .input_rate = c.SDL_GPU_VERTEXINPUTRATE_VERTEX,
+                        .instance_step_rate = 0,
+                        .pitch = @sizeOf(Vertex),
+                    },
+                },
+                .num_vertex_attributes = 3,
+                .vertex_attributes = &[_]c.SDL_GPUVertexAttribute{
+                    .{
+                        .buffer_slot = 0,
+                        .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3,
+                        .location = 0,
+                        .offset = 0,
+                    },
+                    .{
+                        .buffer_slot = 0,
+                        .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4,
+                        .location = 1,
+                        .offset = @sizeOf(f32) * 3,
+                    },
+                    .{
+                        .buffer_slot = 0,
+                        .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2,
+                        .location = 2,
+                        .offset = @sizeOf(f32) * 7,
+                    },
+                },
+            },
+            .primitive_type = c.SDL_GPU_PRIMITIVETYPE_TRIANGLELIST,
+            .vertex_shader = vertex_shader,
+            .fragment_shader = frag_shader,
+        };
+
+        return c.SDL_CreateGPUGraphicsPipeline(
+            device,
+            &pipeline_crete_info,
+        ) orelse return error.TextPipelineCreationFailed;
     }
 
     fn setupGraphicsPipeline(device: *c.SDL_GPUDevice, window: *c.SDL_Window) !*c.SDL_GPUGraphicsPipeline {
@@ -447,70 +541,47 @@ const Game = struct {
 
     fn renderText(
         self: *Game,
-        text: []const u8,
-        x: f32,
-        y: f32,
-        color: c.SDL_Color,
+        text_to_render: []const u8,
+        x_pos: f32,
+        y_pos: f32,
+        text_color: c.SDL_Color,
     ) !void {
-        // Create surface from text
-        var text_buf: [256:0]u8 = undefined;
-        const text_z = try std.fmt.bufPrintZ(&text_buf, "{s}", .{text});
-
-        const surface = c.TTF_RenderText_Blended(
-            self.font,
-            text_z.ptr,
-            0, // null-terminated string
-            color,
-        ) orelse {
-            c.SDL_Log("Failed to render text");
+        // 1. Render text to SDL_Surface
+        const surface = c.TTF_RenderText_Blended(self.font, text_to_render.ptr, 0, text_color) orelse {
+            c.SDL_Log("TTF_RenderUTF8_Blended failed");
             return error.TextRenderFailed;
         };
         defer c.SDL_DestroySurface(surface);
 
-        // Create a quad for the text at the specified position
-        const sprite = SpriteInstance{
-            .x = x,
-            .y = y,
-            .z = 0,
-            .rotation = 0,
-            .w = @floatFromInt(surface.*.w),
-            .h = @floatFromInt(surface.*.h),
-            .tex_u = 0,
-            .tex_v = 0,
-            .tex_w = 1,
-            .tex_h = 1,
-            .r = @as(f32, @floatFromInt(color.r)) / 255.0,
-            .g = @as(f32, @floatFromInt(color.g)) / 255.0,
-            .b = @as(f32, @floatFromInt(color.b)) / 255.0,
-            .a = @as(f32, @floatFromInt(color.a)) / 255.0,
-            .padding_a = 0,
-            .padding_b = 0,
-        };
-
-        // Create texture from surface
+        const texture_transfer_size: u32 = @intCast(surface.*.pitch * surface.*.h);
+        // 2. Create SDL_GPUTexture from surface
+        // 2a. Create Transfer Buffer for texture data
         const texture_transfer_buffer = c.SDL_CreateGPUTransferBuffer(
             self.device,
             &.{
                 .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
-                .size = @intCast(surface.*.pitch * surface.*.h),
+                .size = texture_transfer_size,
             },
         ) orelse return error.TransferBufferCreationFailed;
         defer c.SDL_ReleaseGPUTransferBuffer(self.device, texture_transfer_buffer);
 
-        const texture_transfer_ptr = c.SDL_MapGPUTransferBuffer(
+        // 2b. Map, Copy, Unmap texture data
+        const texture_data_ptr = c.SDL_MapGPUTransferBuffer(
             self.device,
             texture_transfer_buffer,
             false,
         ) orelse return error.TransferBufferMappingFailed;
-
-        _ = c.SDL_memcpy(texture_transfer_ptr, surface.*.pixels, @intCast(surface.*.w * surface.*.h * 4));
+        _ = c.SDL_memcpy(texture_data_ptr, surface.*.pixels, texture_transfer_size);
         c.SDL_UnmapGPUTransferBuffer(self.device, texture_transfer_buffer);
 
-        const text_texture = c.SDL_CreateGPUTexture(
+        // 2c. Create GPU Texture
+        // TTF_RenderUTF8_Blended produces SDL_PIXELFORMAT_ARGB8888.
+        // On little-endian, this is B,G,R,A in memory. So B8G8R8A8_UNORM is the correct GPU format.
+        const text_gpu_texture = c.SDL_CreateGPUTexture(
             self.device,
             &.{
                 .type = c.SDL_GPU_TEXTURETYPE_2D,
-                .format = c.SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+                .format = c.SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM,
                 .width = @intCast(surface.*.w),
                 .height = @intCast(surface.*.h),
                 .layer_count_or_depth = 1,
@@ -518,53 +589,135 @@ const Game = struct {
                 .usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
             },
         ) orelse return error.TextureCreationFailed;
-        defer c.SDL_ReleaseGPUTexture(self.device, text_texture);
+        defer c.SDL_ReleaseGPUTexture(self.device, text_gpu_texture);
 
-        const cmd_buffer = c.SDL_AcquireGPUCommandBuffer(self.device) orelse
-            return error.CommandBufferAcquisitionFailed;
+        // 3. Define quad vertices (pos_x, pos_y, tex_u, tex_v) for 2 triangles
+        const w: f32 = @floatFromInt(surface.*.w);
+        const h: f32 = @floatFromInt(surface.*.h);
+        const quad_vertices = [_]f32{
+            x_pos, y_pos, 0.0, 0.0, // Top-left
+            x_pos + w, y_pos, 1.0, 0.0, // Top-right
+            x_pos, y_pos + h, 0.0, 1.0, // Bottom-left
+            x_pos + w, y_pos, 1.0, 0.0, // Top-right
+            x_pos + w, y_pos + h, 1.0, 1.0, // Bottom-right
+            x_pos, y_pos + h, 0.0, 1.0, // Bottom-left
+        };
+        const vertex_buffer_size = @sizeOf(@TypeOf(quad_vertices));
 
-        const copy_pass = c.SDL_BeginGPUCopyPass(cmd_buffer) orelse
-            return error.CopyPassCreationFailed;
+        // 3a. Create Transfer Buffer for vertex data
+        const vertex_transfer_buffer = c.SDL_CreateGPUTransferBuffer(
+            self.device,
+            &.{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = vertex_buffer_size },
+        ) orelse return error.TransferBufferCreationFailed;
+        defer c.SDL_ReleaseGPUTransferBuffer(self.device, vertex_transfer_buffer);
 
-        // Upload text texture
+        // 3b. Map, Copy, Unmap vertex data
+        const vertex_data_ptr = c.SDL_MapGPUTransferBuffer(self.device, vertex_transfer_buffer, false) orelse return error.TransferBufferMappingFailed;
+        std.mem.copyForwards(f32, @as([*]f32, @ptrCast(@alignCast(vertex_data_ptr)))[0..quad_vertices.len], quad_vertices[0..]);
+        c.SDL_UnmapGPUTransferBuffer(self.device, vertex_transfer_buffer);
+
+        // 3c. Create GPU Vertex Buffer
+        const text_vertex_buffer = c.SDL_CreateGPUBuffer(
+            self.device,
+            &.{ .usage = c.SDL_GPU_BUFFERUSAGE_VERTEX, .size = vertex_buffer_size },
+        ) orelse return error.VertexBufferCreationFailed;
+        defer c.SDL_ReleaseGPUBuffer(self.device, text_vertex_buffer);
+
+        // 4. Prepare for rendering (Command Buffer, Projection Matrix)
+        const cmd_buf = c.SDL_AcquireGPUCommandBuffer(self.device) orelse return error.CommandBufferAcquisitionFailed;
+
+        // Upload texture data
+        const tex_copy_pass = c.SDL_BeginGPUCopyPass(cmd_buf) orelse return error.CopyPassCreationFailed;
         c.SDL_UploadToGPUTexture(
-            copy_pass,
+            tex_copy_pass,
             &.{
                 .transfer_buffer = texture_transfer_buffer,
                 .offset = 0,
             },
             &.{
-                .texture = text_texture,
+                .texture = text_gpu_texture,
                 .w = @intCast(surface.*.w),
                 .h = @intCast(surface.*.h),
                 .d = 1,
             },
             false,
         );
+        c.SDL_EndGPUCopyPass(tex_copy_pass);
 
-        c.SDL_EndGPUCopyPass(copy_pass);
-
-        // Start render pass for the text
-        const render_pass = c.SDL_BeginGPURenderPass(
-            cmd_buffer,
+        // Upload vertex data
+        const vbo_copy_pass = c.SDL_BeginGPUCopyPass(cmd_buf) orelse return error.CopyPassCreationFailed;
+        c.SDL_UploadToGPUBuffer(
+            vbo_copy_pass,
             &.{
-                .texture = text_texture,
-                .cycle = false,
-                .load_op = c.SDL_GPU_LOADOP_LOAD,
-                .store_op = c.SDL_GPU_STOREOP_STORE,
-                .clear_color = .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.0 },
+                .transfer_buffer = vertex_transfer_buffer,
+                .offset = 0,
             },
-            1,
+            &.{
+                .buffer = text_vertex_buffer,
+                .offset = 0,
+                .size = vertex_buffer_size,
+            },
+            false,
+        );
+        c.SDL_EndGPUCopyPass(vbo_copy_pass);
+
+        var window_w: i32 = 0;
+        var window_h: i32 = 0;
+        _ = c.SDL_GetWindowSizeInPixels(self.window, &window_w, &window_h);
+        const projection_matrix = createOrtographicOffCenter(
+            0,
+            @floatFromInt(window_w),
+            @floatFromInt(window_h),
+            0,
+            0,
+            -1,
+        );
+
+        // 5. Render the quad
+        var swapchain_texture_for_text: ?*c.SDL_GPUTexture = null;
+        if (!c.SDL_WaitAndAcquireGPUSwapchainTexture(
+            cmd_buf,
+            self.window,
+            @ptrCast(&swapchain_texture_for_text),
             null,
-        ) orelse return error.RenderPassCreationFailed;
+            null,
+        )) {
+            return error.SwapchainTextureAcquisitionFailed;
+        }
 
-        // Render the text sprite
-        c.SDL_BindGPUGraphicsPipeline(render_pass, self.render_pipeline);
-        c.SDL_PushGPUVertexUniformData(cmd_buffer, 0, &sprite, @sizeOf(SpriteInstance));
-        c.SDL_DrawGPUPrimitives(render_pass, 6, 1, 0, 0);
-        c.SDL_EndGPURenderPass(render_pass);
+        if (swapchain_texture_for_text) |target_texture| {
+            const text_render_pass = c.SDL_BeginGPURenderPass(
+                cmd_buf,
+                &.{ // Color attachment
+                    .texture = target_texture,
+                    .cycle = false,
+                    .load_op = c.SDL_GPU_LOADOP_LOAD, // Load previous content (draw on top)
+                    .store_op = c.SDL_GPU_STOREOP_STORE,
+                    .clear_color = .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.0 }, // Not used for LOAD
+                },
+                1,
+                null,
+            ) orelse return error.RenderPassCreationFailed;
 
-        _ = c.SDL_SubmitGPUCommandBuffer(cmd_buffer);
+            c.SDL_BindGPUGraphicsPipeline(text_render_pass, self.text_render_pipeline);
+            c.SDL_BindGPUVertexBuffers(text_render_pass, 0, &.{
+                .buffer = text_vertex_buffer,
+                .offset = 0,
+            }, 1);
+            c.SDL_BindGPUFragmentSamplers(
+                text_render_pass,
+                0,
+                &.{ .texture = text_gpu_texture, .sampler = self.sampler },
+                1,
+            );
+            c.SDL_PushGPUVertexUniformData(cmd_buf, 0, &projection_matrix, @sizeOf(Matrix4x4));
+            c.SDL_DrawGPUPrimitives(text_render_pass, 6, 1, 0, 0); // 6 vertices for 2 triangles
+            c.SDL_EndGPURenderPass(text_render_pass);
+        }
+
+        if (!c.SDL_SubmitGPUCommandBuffer(cmd_buf)) {
+            return error.CommandBufferSubmissionFailed;
+        }
     }
 
     fn render(self: *Game) !void {
@@ -618,6 +771,7 @@ const Game = struct {
         c.SDL_ReleaseGPUTransferBuffer(self.device, self.sprite_data_transfer_buffer);
         c.SDL_ReleaseGPUSampler(self.device, self.sampler);
         c.SDL_ReleaseGPUTexture(self.device, self.texture);
+        c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.text_render_pipeline); // Release text pipeline
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.render_pipeline);
         c.SDL_ReleaseWindowFromGPUDevice(self.device, self.window);
         c.SDL_DestroyGPUDevice(self.device);
@@ -651,12 +805,13 @@ pub fn main() !void {
 
     while (game.running) {
         game.handleEvents();
-        // try game.renderText(
-        //     "Hello, World!",
-        //     10,
-        //     10,
-        //     .{ .a = 1, .r = 1, .g = 1, .b = 1 },
-        // );
-        try game.render();
+        try game.renderText(
+            "Hello, World!",
+            10,
+            10,
+            // SDL_Color components are u8 (0-255)
+            .{ .r = 255, .g = 255, .b = 255, .a = 255 },
+        );
+        // try game.render();
     }
 }

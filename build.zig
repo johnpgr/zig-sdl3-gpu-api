@@ -127,11 +127,18 @@ pub fn build(b: *std.Build) void {
                 exe.subsystem = .Windows;
             }
             exe.addLibraryPath(.{ .cwd_relative = "thirdparty/SDL3_3.2.14-win32-x64/" });
+            exe.addLibraryPath(.{ .cwd_relative = "thirdparty/SDL3_ttf-3.2.2-win32-x64/" });
             const sdl_dll_dep = b.addInstallBinFile(
                 b.path("thirdparty/SDL3_3.2.14-win32-x64/SDL3.dll"),
                 "SDL3.dll",
             );
             exe.step.dependOn(&sdl_dll_dep.step);
+
+            const sdl_ttf_dll_dep = b.addInstallBinFile(
+                b.path("./thirdparty/SDL3_ttf-3.2.2-win32-x64/SDL3_ttf.dll"),
+                "SDL3_ttf.dll",
+            );
+            exe.step.dependOn(&sdl_ttf_dll_dep.step);
         },
         else => {
             std.log.debug("Unsupported target OS: {}", .{target_os});
