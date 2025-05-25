@@ -1,13 +1,6 @@
 const std = @import("std");
 const math3d = @import("math3d.zig");
 
-const dxil = @import("shader.dxil.zig");
-const spv = @import("shader.spv.zig");
-const msl = @import("shader.msl.zig");
-const dxil_sdf = @import("shader-sdf.dxil.zig");
-const spv_sdf = @import("shader-sdf.spv.zig");
-const msl_sdf = @import("shader-sdf.msl.zig");
-
 const c = @cImport({
     @cDefine("SDL_DISABLE_OLDNAMES", {});
     @cInclude("SDL3/SDL.h");
@@ -18,12 +11,6 @@ const MAX_VERTEX_COUNT = 4000;
 const MAX_INDEX_COUNT = 6000;
 const SUPPORTED_SHADER_FORMATS =
     c.SDL_GPU_SHADERFORMAT_SPIRV | c.SDL_GPU_SHADERFORMAT_DXIL | c.SDL_GPU_SHADERFORMAT_MSL;
-
-const ShaderType = enum {
-    VertexShader,
-    PixelShader,
-    PixelShader_SDF,
-};
 
 const Color = c.SDL_FColor;
 const Vec2 = c.SDL_FPoint;
@@ -69,7 +56,7 @@ const Context = struct {
 
         const vertex_shader = try loadShader(
             device,
-            .VertexShader,
+            "font-shader.vert",
             0,
             1,
             0,
@@ -79,7 +66,7 @@ const Context = struct {
 
         const fragment_shader = try loadShader(
             device,
-            if (use_sdf) .PixelShader_SDF else .PixelShader,
+            if (use_sdf) "font-shader-sdf.frag" else "font-shader.frag",
             1,
             0,
             0,
@@ -204,9 +191,21 @@ const Context = struct {
             return error.TransferBufferMappingFailed;
         };
 
-        @memcpy(@as([*]u8, @ptrCast(transfer_data))[0 .. @sizeOf(Vertex) * @as(usize, @intCast(geometry_data.vertex_count))], std.mem.sliceAsBytes(geometry_data.vertices[0..@intCast(geometry_data.vertex_count)]));
+        const vertex_slice = geometry_data.vertices[0..@intCast(geometry_data.vertex_count)];
+        const index_slice = geometry_data.indices[0..@intCast(geometry_data.index_count)];
 
-        @memcpy(@as([*]u8, @ptrCast(transfer_data))[MAX_VERTEX_COUNT..][0 .. @sizeOf(i32) * @as(usize, @intCast(geometry_data.vertex_count))], std.mem.sliceAsBytes(geometry_data.indices[0..@intCast(geometry_data.index_count)]));
+        const vertex_bytes_to_copy = @sizeOf(Vertex) * vertex_slice.len;
+        const index_bytes_to_copy = @sizeOf(i32) * index_slice.len;
+
+        // This is the offset in the transfer buffer where index data begins.
+        const index_buffer_offset_in_transfer_buffer = @sizeOf(Vertex) * MAX_VERTEX_COUNT;
+
+        const dest_vertices_slice = @as([*]u8, @ptrCast(transfer_data))[0..vertex_bytes_to_copy];
+        const dest_indices_ptr = @as([*]u8, @ptrCast(transfer_data)) + index_buffer_offset_in_transfer_buffer;
+        const dest_indices_slice = dest_indices_ptr[0..index_bytes_to_copy];
+
+        @memcpy(dest_vertices_slice, std.mem.sliceAsBytes(vertex_slice));
+        @memcpy(dest_indices_slice, std.mem.sliceAsBytes(index_slice));
 
         c.SDL_UnmapGPUTransferBuffer(self.device, self.transfer_buffer);
     }
@@ -317,6 +316,7 @@ const Context = struct {
     }
 
     fn deinit(self: *Context) void {
+        _ = c.SDL_WaitForGPUIdle(self.device);
         c.SDL_ReleaseGPUTransferBuffer(self.device, self.transfer_buffer);
         c.SDL_ReleaseGPUSampler(self.device, self.sampler);
         c.SDL_ReleaseGPUBuffer(self.device, self.vertex_buffer);
@@ -340,7 +340,7 @@ const GeometryData = struct {
         color: *const Color,
     ) !void {
         var i: i32 = 0;
-        while (0 < sequence.num_vertices) : (i += 1) {
+        while (i < sequence.num_vertices) : (i += 1) {
             const idx: usize = @intCast(i);
             const pos = sequence.xy[idx];
             const vert = Vertex{
@@ -349,14 +349,14 @@ const GeometryData = struct {
                 .uv = sequence.uv[idx],
             };
             self.vertices[@intCast(self.vertex_count + i)] = vert;
-
-            const dest_indices = self.indices[@intCast(self.index_count)..];
-            const src_indices = sequence.indices[0..@intCast(sequence.num_indices)];
-            @memcpy(dest_indices[0..@intCast(sequence.num_indices)], src_indices);
-
-            self.vertex_count += sequence.num_vertices;
-            self.index_count += sequence.num_indices;
         }
+
+        const new_indices = self.indices[@intCast(self.index_count)..];
+        const sequence_indices = sequence.indices[0..@intCast(sequence.num_indices)];
+        @memcpy(new_indices[0..sequence_indices.len], sequence_indices);
+
+        self.vertex_count += sequence.num_vertices;
+        self.index_count += sequence.num_indices;
     }
 
     fn queueText(self: *GeometryData, sequence: *c.TTF_GPUAtlasDrawSequence, color: *const Color) !void {
@@ -367,96 +367,70 @@ const GeometryData = struct {
     }
 };
 
-fn loadShader(
+pub fn loadShader(
     device: *c.SDL_GPUDevice,
-    shader_type: ShaderType,
+    shader_name: []const u8,
     sampler_count: u32,
     uniform_buffer_count: u32,
     storage_buffer_count: u32,
     storage_texture_count: u32,
 ) !*c.SDL_GPUShader {
-    var create_info = c.SDL_GPUShaderCreateInfo{
+    const stage: c.SDL_GPUShaderStage =
+        if (c.SDL_strstr(shader_name.ptr, ".vert") != null)
+            c.SDL_GPU_SHADERSTAGE_VERTEX
+        else if (c.SDL_strstr(shader_name.ptr, ".frag") != null)
+            c.SDL_GPU_SHADERSTAGE_FRAGMENT
+        else {
+            c.SDL_Log("Invalid shader stage for file: %s", &shader_name);
+            return error.InvalidShaderStage;
+        };
+
+    const backend_formats = c.SDL_GetGPUShaderFormats(device);
+    var format: c.SDL_GPUShaderFormat = c.SDL_GPU_SHADERFORMAT_INVALID;
+    var extension: []const u8 = undefined;
+    var entrypoint: []const u8 = "main";
+
+    if (backend_formats & c.SDL_GPU_SHADERFORMAT_SPIRV != 0) {
+        format = c.SDL_GPU_SHADERFORMAT_SPIRV;
+        extension = ".spv";
+    } else if (backend_formats & c.SDL_GPU_SHADERFORMAT_DXIL != 0) {
+        format = c.SDL_GPU_SHADERFORMAT_DXIL;
+        extension = ".dxil";
+    } else if (backend_formats & c.SDL_GPU_SHADERFORMAT_MSL != 0) {
+        format = c.SDL_GPU_SHADERFORMAT_MSL;
+        extension = ".msl";
+        entrypoint = "main0";
+    } else {
+        c.SDL_Log("Unrecognized shader format for file: %s", &shader_name);
+        return error.NoSupportedShaderFormats;
+    }
+
+    var shader_path_buf: [256]u8 = undefined;
+    const shader_path = try std.fmt.bufPrintZ(
+        &shader_path_buf,
+        "assets/shaders/compiled/{s}{s}",
+        .{ shader_name, extension },
+    );
+
+    var code_size: usize = 0;
+    const code = c.SDL_LoadFile(shader_path.ptr, &code_size) orelse {
+        c.SDL_Log("Failed to load shader file: %s", shader_path.ptr);
+        return error.ShaderFileLoadFailed;
+    };
+    c.SDL_Log("Loaded shader file: %s, size: %zu bytes", shader_path.ptr, code_size);
+    defer c.SDL_free(code);
+
+    return c.SDL_CreateGPUShader(device, &.{
+        .code = @ptrCast(code),
+        .code_size = code_size,
+        .entrypoint = entrypoint.ptr,
+        .format = format,
+        .stage = stage,
         .num_samplers = sampler_count,
+        .num_uniform_buffers = uniform_buffer_count,
         .num_storage_buffers = storage_buffer_count,
         .num_storage_textures = storage_texture_count,
-        .num_uniform_buffers = uniform_buffer_count,
-        .props = 0,
-    };
-
-    const format = c.SDL_GetGPUShaderFormats(device);
-
-    if ((format & c.SDL_GPU_SHADERFORMAT_DXIL) != 0) {
-        create_info.format = c.SDL_GPU_SHADERFORMAT_DXIL;
-        switch (shader_type) {
-            .VertexShader => {
-                create_info.code = @ptrCast(dxil.shader_vert);
-                create_info.code_size = dxil.shader_vert.len;
-                create_info.entrypoint = "VSMain";
-            },
-            .PixelShader => {
-                create_info.code = @ptrCast(dxil.shader_frag);
-                create_info.code_size = dxil.shader_frag.len;
-                create_info.entrypoint = "PSMain";
-            },
-            .PixelShader_SDF => {
-                create_info.code = @ptrCast(dxil_sdf.shader_sdf_frag);
-                create_info.code_size = dxil_sdf.shader_sdf_frag.len;
-                create_info.entrypoint = "PSMain";
-            },
-        }
-    } else if ((format & c.SDL_GPU_SHADERFORMAT_MSL) != 0) {
-        create_info.format = c.SDL_GPU_SHADERFORMAT_MSL;
-        switch (shader_type) {
-            .VertexShader => {
-                create_info.code = @ptrCast(msl.shader_vert);
-                create_info.code_size = msl.shader_vert.len;
-                create_info.entrypoint = "VSMain";
-            },
-            .PixelShader => {
-                create_info.code = @ptrCast(msl.shader_frag);
-                create_info.code_size = msl.shader_frag.len;
-                create_info.entrypoint = "PSMain";
-            },
-            .PixelShader_SDF => {
-                create_info.code = @ptrCast(msl_sdf.shader_sdf_frag);
-                create_info.code_size = msl_sdf.shader_sdf_frag.len;
-                create_info.entrypoint = "PSMain";
-            },
-        }
-    } else if ((format & c.SDL_GPU_SHADERFORMAT_SPIRV) != 0) {
-        create_info.format = c.SDL_GPU_SHADERFORMAT_SPIRV;
-        switch (shader_type) {
-            .VertexShader => {
-                create_info.code = @ptrCast(spv.shader_vert);
-                create_info.code_size = spv.shader_vert.len;
-                create_info.entrypoint = "VSMain";
-            },
-            .PixelShader => {
-                create_info.code = @ptrCast(spv.shader_frag);
-                create_info.code_size = spv.shader_frag.len;
-                create_info.entrypoint = "PSMain";
-            },
-            .PixelShader_SDF => {
-                create_info.code = @ptrCast(spv_sdf.shader_sdf_frag);
-                create_info.code_size = spv_sdf.shader_sdf_frag.len;
-                create_info.entrypoint = "PSMain";
-            },
-        }
-    } else {
-        return error.UnsupportedShaderFormat;
-    }
-
-    if (shader_type == .VertexShader) {
-        create_info.stage = c.SDL_GPU_SHADERSTAGE_VERTEX;
-    } else {
-        create_info.stage = c.SDL_GPU_SHADERSTAGE_FRAGMENT;
-    }
-
-    return c.SDL_CreateGPUShader(device, &create_info) orelse {
-        c.SDL_Log(
-            "Failed to create shader: %s",
-            c.SDL_GetError(),
-        );
+    }) orelse {
         return error.ShaderCreationFailed;
     };
 }
@@ -524,7 +498,7 @@ pub fn main() !void {
         .index_count = 0,
     };
 
-    const font = c.TTF_OpenFont(@ptrCast(font_filename), 50) orelse {
+    const font = c.TTF_OpenFont(font_filename.?.ptr, 50) orelse {
         c.SDL_Log("Failed to open font: %s", c.SDL_GetError());
         return error.FontLoadingFailed;
     };
@@ -541,8 +515,15 @@ pub fn main() !void {
         return error.GPUTextEngineCreationFailed;
     };
 
+    defer {
+        _ = c.SDL_WaitForGPUIdle(context.device);
+        c.TTF_DestroyGPUTextEngine(engine);
+    }
+
     var str = "Hello, SDL GPU Text!".*;
     const text = c.TTF_CreateText(engine, font, &str, 0);
+    defer c.TTF_DestroyText(text);
+
     var matrices = [_]Mat4x4{
         Mat4x4.perspective(c.SDL_PI_F / 2.0, 800.0 / 600.0, 0.1, 100.0),
         Mat4x4.identity(),
@@ -588,11 +569,13 @@ pub fn main() !void {
         }
         rot_angle = c.SDL_fmodf(rot_angle + 0.01, 2 * c.SDL_PI_F);
 
-        var model = Mat4x4.identity();
-        model = model.multiply(Mat4x4.translation(.{ .x = 0.0, .y = 0.0, .z = -80.0 }));
-        model = model.multiply(Mat4x4.scaling(.{ .x = 0.3, .y = 0.3, .z = 0.3 }));
-        model = model.multiply(Mat4x4.rotationY(rot_angle));
-        model = model.multiply(Mat4x4.translation(.{ .x = -@as(f32, @floatFromInt(tw)) / 2.0, .y = @as(f32, @floatFromInt(th)) / 2.0, .z = 0.0 }));
+        const model = Mat4x4.identity()
+            .multiply(Mat4x4.translation(.{ .x = 0.0, .y = 0.0, .z = -80.0 }))
+            .multiply(Mat4x4.scaling(.{ .x = 0.3, .y = 0.3, .z = 0.3 }))
+            .multiply(Mat4x4.rotationY(rot_angle))
+            .multiply(Mat4x4.translation(
+            .{ .x = -@as(f32, @floatFromInt(tw)) / 2.0, .y = @as(f32, @floatFromInt(th)) / 2.0, .z = 0.0 },
+        ));
         matrices[1] = model;
 
         const sequence = c.TTF_GetGPUTextDrawData(text);
