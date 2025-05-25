@@ -174,6 +174,7 @@ const Context = struct {
             return error.SamplerCreationFailed;
         };
 
+
         return .{
             .device = device,
             .window = window,
@@ -564,7 +565,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var font_filename: ?[]const u8 = null;
+    const font_filename: []const u8 = "assets/fonts/retro-gaming.ttf";
     var use_sdf = false;
 
     const args = try std.process.argsAlloc(allocator);
@@ -576,18 +577,7 @@ pub fn main() !void {
             use_sdf = true;
         } else if (args[i][0] == '-') {
             break;
-        } else {
-            font_filename = args[i];
-            break;
         }
-    }
-
-    if (font_filename == null) {
-        c.SDL_LogError(
-            c.SDL_LOG_CATEGORY_APPLICATION,
-            "Usage: testgputext [--sdf] FONT_FILENAME",
-        );
-        return error.InvalidArguments;
     }
 
     if (!c.SDL_Init(c.SDL_INIT_VIDEO | c.SDL_INIT_EVENTS)) {
@@ -609,6 +599,8 @@ pub fn main() !void {
     var context = try Context.init(use_sdf);
     defer context.deinit();
 
+    _ = c.SDL_ShowWindow(context.window);
+
     const vertices = try allocator.alloc(Vertex, MAX_VERTEX_COUNT);
     defer allocator.free(vertices);
 
@@ -622,7 +614,7 @@ pub fn main() !void {
         .index_count = 0,
     };
 
-    const font = c.TTF_OpenFont(font_filename.?.ptr, 50) orelse {
+    const font = c.TTF_OpenFont(font_filename.ptr, 50) orelse {
         c.SDL_Log("Failed to open font: %s", c.SDL_GetError());
         return error.FontLoadingFailed;
     };
