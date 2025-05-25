@@ -7,6 +7,8 @@ const c = @cImport({
     @cInclude("SDL3_ttf/SDL_ttf.h");
 });
 
+const IMAGES_BASE_PATH = "assets/images/";
+const SPRITE_COUNT: u32 = 1000; // Reduced for demo
 const MAX_VERTEX_COUNT = 4000;
 const MAX_INDEX_COUNT = 6000;
 const SUPPORTED_SHADER_FORMATS =
@@ -17,26 +19,141 @@ const Vec2 = c.SDL_FPoint;
 const Vec3 = math3d.Vec3;
 const Vec4 = math3d.Vec4;
 const Mat4x4 = math3d.Mat4x4;
+const Matrix4x4 = [4][4]f32;
 
-const Vertex = struct {
+// FPS tracking structure
+const FPSCounter = struct {
+    frame_count: u32,
+    last_time: u64,
+    fps: f32,
+    update_interval: u64, // in milliseconds
+    fps_buffer: [64]u8, // Buffer to store FPS string
+
+    fn init() FPSCounter {
+        return FPSCounter{
+            .frame_count = 0,
+            .last_time = c.SDL_GetTicks(),
+            .fps = 0.0,
+            .update_interval = 500, // Update every 500ms
+            .fps_buffer = undefined,
+        };
+    }
+
+    fn update(self: *FPSCounter) void {
+        self.frame_count += 1;
+        const current_time = c.SDL_GetTicks();
+        const elapsed = current_time - self.last_time;
+
+        if (elapsed >= self.update_interval) {
+            self.fps = @as(f32, @floatFromInt(self.frame_count)) / (@as(f32, @floatFromInt(elapsed)) / 1000.0);
+            self.frame_count = 0;
+            self.last_time = current_time;
+        }
+    }
+
+    fn toString(self: *FPSCounter) []const u8 {
+        return std.fmt.bufPrintZ(&self.fps_buffer, "FPS: {d:.1}", .{self.fps}) catch "FPS: --";
+    }
+};
+
+// Sprite rendering structures
+const SpriteVertex = struct {
+    x: f32,
+    y: f32,
+    z: f32,
+    colour: c.SDL_FColor,
+    uv: c.SDL_FPoint,
+};
+
+const SpriteInstance = packed struct {
+    x: f32,
+    y: f32,
+    z: f32,
+    rotation: f32,
+    w: f32,
+    h: f32,
+    padding_a: f32,
+    padding_b: f32,
+    tex_u: f32,
+    tex_v: f32,
+    tex_w: f32,
+    tex_h: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+};
+
+// Text rendering structures
+const TextVertex = struct {
     pos: Vec3,
     color: Color,
     uv: Vec2,
 };
 
-const Context = struct {
+const GeometryData = struct {
+    vertices: []TextVertex,
+    vertex_count: i32,
+    indices: []i32,
+    index_count: i32,
+
+    fn queueTextSequence(
+        self: *GeometryData,
+        sequence: *const c.TTF_GPUAtlasDrawSequence,
+        color: *const Color,
+    ) !void {
+        var i: i32 = 0;
+        while (i < sequence.num_vertices) : (i += 1) {
+            const idx: usize = @intCast(i);
+            const pos = sequence.xy[idx];
+            const vert = TextVertex{
+                .pos = .{ .x = pos.x, .y = pos.y, .z = 0.0 },
+                .color = color.*,
+                .uv = sequence.uv[idx],
+            };
+            self.vertices[@intCast(self.vertex_count + i)] = vert;
+        }
+
+        const new_indices = self.indices[@intCast(self.index_count)..];
+        const sequence_indices = sequence.indices[0..@intCast(sequence.num_indices)];
+        @memcpy(new_indices[0..sequence_indices.len], sequence_indices);
+
+        self.vertex_count += sequence.num_vertices;
+        self.index_count += sequence.num_indices;
+    }
+
+    fn reset(self: *GeometryData) void {
+        self.vertex_count = 0;
+        self.index_count = 0;
+    }
+};
+
+const CombinedRenderer = struct {
     device: *c.SDL_GPUDevice,
     window: *c.SDL_Window,
-    pipeline: *c.SDL_GPUGraphicsPipeline,
-    vertex_buffer: *c.SDL_GPUBuffer,
-    index_buffer: *c.SDL_GPUBuffer,
-    transfer_buffer: *c.SDL_GPUTransferBuffer,
-    sampler: *c.SDL_GPUSampler,
-    cmd_buf: ?*c.SDL_GPUCommandBuffer,
+    
+    // Sprite rendering resources
+    sprite_pipeline: *c.SDL_GPUGraphicsPipeline,
+    sprite_texture: *c.SDL_GPUTexture,
+    sprite_sampler: *c.SDL_GPUSampler,
+    sprite_data_transfer_buffer: *c.SDL_GPUTransferBuffer,
+    sprite_data_buffer: *c.SDL_GPUBuffer,
+    
+    // Text rendering resources
+    text_pipeline: *c.SDL_GPUGraphicsPipeline,
+    text_vertex_buffer: *c.SDL_GPUBuffer,
+    text_index_buffer: *c.SDL_GPUBuffer,
+    text_transfer_buffer: *c.SDL_GPUTransferBuffer,
+    text_sampler: *c.SDL_GPUSampler,
+    text_engine: *c.TTF_TextEngine,
+    font: *c.TTF_Font,
 
-    fn init(use_sdf: bool) !Context {
+    const u_coords: [4]f32 = .{ 0.0, 0.5, 0.0, 0.5 };
+    const v_coords: [4]f32 = .{ 0.0, 0.0, 0.5, 0.5 };
+
+    fn init(use_sdf: bool, font_filename: []const u8) !CombinedRenderer {
         const window = c.SDL_CreateWindow(
-            "SDL Gpu Text Example",
+            "Combined Sprite and Text Renderer",
             800,
             600,
             c.SDL_WINDOW_HIDDEN,
@@ -58,14 +175,89 @@ const Context = struct {
             return error.WindowClaimFailed;
         }
 
-        const vertex_shader = try loadShader(
+        // Setup sprite pipeline
+        const sprite_pipeline = try setupSpritePipeline(device, window);
+        errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, sprite_pipeline);
+
+        // Setup text pipeline
+        const text_pipeline = try setupTextPipeline(device, window, use_sdf);
+        errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, text_pipeline);
+
+        // Setup sprite resources
+        const sprite_data = try setupSpriteResources(device);
+        errdefer {
+            c.SDL_ReleaseGPUSampler(device, sprite_data.sampler);
+            c.SDL_ReleaseGPUTexture(device, sprite_data.texture);
+            c.SDL_ReleaseGPUBuffer(device, sprite_data.storage_buffer);
+            c.SDL_ReleaseGPUTransferBuffer(device, sprite_data.transfer_buffer);
+        }
+
+        // Setup text resources
+        const text_data = try setupTextResources(device, font_filename, use_sdf);
+        errdefer {
+            c.TTF_DestroyGPUTextEngine(text_data.engine);
+            c.TTF_CloseFont(text_data.font);
+            c.SDL_ReleaseGPUSampler(device, text_data.sampler);
+            c.SDL_ReleaseGPUBuffer(device, text_data.vertex_buffer);
+            c.SDL_ReleaseGPUBuffer(device, text_data.index_buffer);
+            c.SDL_ReleaseGPUTransferBuffer(device, text_data.transfer_buffer);
+        }
+
+        return CombinedRenderer{
+            .device = device,
+            .window = window,
+            .sprite_pipeline = sprite_pipeline,
+            .sprite_texture = sprite_data.texture,
+            .sprite_sampler = sprite_data.sampler,
+            .sprite_data_transfer_buffer = sprite_data.transfer_buffer,
+            .sprite_data_buffer = sprite_data.storage_buffer,
+            .text_pipeline = text_pipeline,
+            .text_vertex_buffer = text_data.vertex_buffer,
+            .text_index_buffer = text_data.index_buffer,
+            .text_transfer_buffer = text_data.transfer_buffer,
+            .text_sampler = text_data.sampler,
+            .text_engine = text_data.engine,
+            .font = text_data.font,
+        };
+    }
+
+    fn setupSpritePipeline(device: *c.SDL_GPUDevice, window: *c.SDL_Window) !*c.SDL_GPUGraphicsPipeline {
+        const vertex_shader = try loadShader(device, "pull-sprite-batch.vert", 0, 1, 1, 0);
+        defer c.SDL_ReleaseGPUShader(device, vertex_shader);
+
+        const frag_shader = try loadShader(device, "textured-quad-color.frag", 1, 0, 0, 0);
+        defer c.SDL_ReleaseGPUShader(device, frag_shader);
+
+        const color_target_descriptions = c.SDL_GPUColorTargetDescription{
+            .format = c.SDL_GetGPUSwapchainTextureFormat(device, window),
+            .blend_state = .{
+                .enable_blend = true,
+                .color_blend_op = c.SDL_GPU_BLENDOP_ADD,
+                .alpha_blend_op = c.SDL_GPU_BLENDOP_ADD,
+                .src_color_blendfactor = c.SDL_GPU_BLENDFACTOR_SRC_ALPHA,
+                .dst_color_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+                .src_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_SRC_ALPHA,
+                .dst_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+                .color_write_mask = 0xF,
+            },
+        };
+
+        return c.SDL_CreateGPUGraphicsPipeline(
             device,
-            "font-shader.vert",
-            0,
-            1,
-            0,
-            0,
-        );
+            &.{
+                .target_info = .{
+                    .num_color_targets = 1,
+                    .color_target_descriptions = &color_target_descriptions,
+                },
+                .primitive_type = c.SDL_GPU_PRIMITIVETYPE_TRIANGLELIST,
+                .vertex_shader = vertex_shader,
+                .fragment_shader = frag_shader,
+            },
+        ) orelse return error.SpritePipelineCreationFailed;
+    }
+
+    fn setupTextPipeline(device: *c.SDL_GPUDevice, window: *c.SDL_Window, use_sdf: bool) !*c.SDL_GPUGraphicsPipeline {
+        const vertex_shader = try loadShader(device, "font-shader.vert", 0, 1, 0, 0);
         errdefer c.SDL_ReleaseGPUShader(device, vertex_shader);
 
         const fragment_shader = try loadShader(
@@ -103,7 +295,7 @@ const Context = struct {
                     .slot = 0,
                     .input_rate = c.SDL_GPU_VERTEXINPUTRATE_VERTEX,
                     .instance_step_rate = 0,
-                    .pitch = @sizeOf(Vertex),
+                    .pitch = @sizeOf(TextVertex),
                 }},
                 .num_vertex_attributes = 3,
                 .vertex_attributes = &[_]c.SDL_GPUVertexAttribute{
@@ -133,18 +325,56 @@ const Context = struct {
         };
 
         const pipeline = c.SDL_CreateGPUGraphicsPipeline(device, &pipeline_create_info) orelse {
-            return error.PipelineCreationFailed;
+            return error.TextPipelineCreationFailed;
         };
-        errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, pipeline);
 
         c.SDL_ReleaseGPUShader(device, vertex_shader);
         c.SDL_ReleaseGPUShader(device, fragment_shader);
 
+        return pipeline;
+    }
+
+    fn setupSpriteResources(device: *c.SDL_GPUDevice) !struct {
+        texture: *c.SDL_GPUTexture,
+        sampler: *c.SDL_GPUSampler,
+        transfer_buffer: *c.SDL_GPUTransferBuffer,
+        storage_buffer: *c.SDL_GPUBuffer,
+    } {
+        // Load sprite texture
+        const texture_data = try setupTextureData(device);
+        errdefer {
+            c.SDL_ReleaseGPUSampler(device, texture_data.sampler);
+            c.SDL_ReleaseGPUTexture(device, texture_data.texture);
+        }
+
+        // Create sprite buffers
+        const sprite_buffers = try setupSpriteBuffers(device);
+        errdefer {
+            c.SDL_ReleaseGPUBuffer(device, sprite_buffers.storage_buffer);
+            c.SDL_ReleaseGPUTransferBuffer(device, sprite_buffers.transfer_buffer);
+        }
+
+        return .{
+            .texture = texture_data.texture,
+            .sampler = texture_data.sampler,
+            .transfer_buffer = sprite_buffers.transfer_buffer,
+            .storage_buffer = sprite_buffers.storage_buffer,
+        };
+    }
+
+    fn setupTextResources(device: *c.SDL_GPUDevice, font_filename: []const u8, use_sdf: bool) !struct {
+        engine: *c.TTF_TextEngine,
+        font: *c.TTF_Font,
+        vertex_buffer: *c.SDL_GPUBuffer,
+        index_buffer: *c.SDL_GPUBuffer,
+        transfer_buffer: *c.SDL_GPUTransferBuffer,
+        sampler: *c.SDL_GPUSampler,
+    } {
         const vertex_buffer = c.SDL_CreateGPUBuffer(device, &.{
             .usage = c.SDL_GPU_BUFFERUSAGE_VERTEX,
-            .size = @sizeOf(Vertex) * MAX_VERTEX_COUNT,
+            .size = @sizeOf(TextVertex) * MAX_VERTEX_COUNT,
         }) orelse {
-            return error.VertexBufferCreationFailed;
+            return error.TextVertexBufferCreationFailed;
         };
         errdefer c.SDL_ReleaseGPUBuffer(device, vertex_buffer);
 
@@ -152,16 +382,17 @@ const Context = struct {
             .usage = c.SDL_GPU_BUFFERUSAGE_INDEX,
             .size = @sizeOf(i32) * MAX_INDEX_COUNT,
         }) orelse {
-            return error.IndexBufferCreationFailed;
+            return error.TextIndexBufferCreationFailed;
         };
         errdefer c.SDL_ReleaseGPUBuffer(device, index_buffer);
 
         const transfer_buffer = c.SDL_CreateGPUTransferBuffer(device, &.{
             .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
-            .size = (@sizeOf(Vertex) * MAX_VERTEX_COUNT) + (@sizeOf(i32) * MAX_INDEX_COUNT),
+            .size = (@sizeOf(TextVertex) * MAX_VERTEX_COUNT) + (@sizeOf(i32) * MAX_INDEX_COUNT),
         }) orelse {
-            return error.TransferBufferCreationFailed;
+            return error.TextTransferBufferCreationFailed;
         };
+        errdefer c.SDL_ReleaseGPUTransferBuffer(device, transfer_buffer);
 
         const sampler = c.SDL_CreateGPUSampler(device, &.{
             .min_filter = c.SDL_GPU_FILTER_LINEAR,
@@ -171,38 +402,210 @@ const Context = struct {
             .address_mode_v = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
             .address_mode_w = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
         }) orelse {
-            return error.SamplerCreationFailed;
+            return error.TextSamplerCreationFailed;
         };
+        errdefer c.SDL_ReleaseGPUSampler(device, sampler);
 
+        const font = c.TTF_OpenFont(font_filename.ptr, 50) orelse {
+            c.SDL_Log("Failed to open font: %s", c.SDL_GetError());
+            return error.FontLoadingFailed;
+        };
+        errdefer c.TTF_CloseFont(font);
+
+        if (!c.TTF_SetFontSDF(font, use_sdf)) {
+            c.SDL_Log("Failed to set font SDF mode: %s", c.SDL_GetError());
+            return error.FontSDFSettingFailed;
+        }
+
+        const engine = c.TTF_CreateGPUTextEngine(device) orelse {
+            c.SDL_Log("Failed to create GPU text engine: %s", c.SDL_GetError());
+            return error.GPUTextEngineCreationFailed;
+        };
+        errdefer c.TTF_DestroyGPUTextEngine(engine);
 
         return .{
-            .device = device,
-            .window = window,
-            .pipeline = pipeline,
+            .engine = engine,
+            .font = font,
             .vertex_buffer = vertex_buffer,
             .index_buffer = index_buffer,
             .transfer_buffer = transfer_buffer,
             .sampler = sampler,
-            .cmd_buf = null,
         };
     }
 
-    fn setGeometryData(self: *Context, geometry_data: *GeometryData) !void {
+    fn render(self: *CombinedRenderer, geometry_data: *GeometryData) !void {
+        const sprite_matrix = createOrtographicOffCenter(0, 800, 600, 0, 0, -1);
+        const text_matrices = [_]Mat4x4{
+            Mat4x4.ortho(0.0, 800.0, 0.0, 600.0, -1.0, 1.0),
+            Mat4x4.identity(),
+        };
+
+        const cmd_buffer = c.SDL_AcquireGPUCommandBuffer(self.device) orelse {
+            return error.CommandBufferAcquisitionFailed;
+        };
+
+        var swapchain_texture: ?*c.SDL_GPUTexture = null;
+        if (!c.SDL_WaitAndAcquireGPUSwapchainTexture(
+            cmd_buffer,
+            self.window,
+            &swapchain_texture,
+            null,
+            null,
+        )) {
+            return error.SwapchainTextureAcquireFailed;
+        }
+
+        if (swapchain_texture) |texture| {
+            // Upload sprite data
+            try self.uploadSpriteData(cmd_buffer);
+
+            // Upload text data if we have any
+            if (geometry_data.vertex_count > 0) {
+                try self.uploadTextData(geometry_data, cmd_buffer);
+            }
+
+            const color_target_info = c.SDL_GPUColorTargetInfo{
+                .texture = texture,
+                .clear_color = .{ .r = 0.2, .g = 0.3, .b = 0.4, .a = 1.0 },
+                .load_op = c.SDL_GPU_LOADOP_CLEAR,
+                .store_op = c.SDL_GPU_STOREOP_STORE,
+            };
+
+            const render_pass = c.SDL_BeginGPURenderPass(
+                cmd_buffer,
+                &color_target_info,
+                1,
+                null,
+            ) orelse {
+                return error.RenderPassStartFailed;
+            };
+
+            // Render sprites first (background)
+            c.SDL_BindGPUGraphicsPipeline(render_pass, self.sprite_pipeline);
+            c.SDL_BindGPUVertexStorageBuffers(render_pass, 0, &self.sprite_data_buffer, 1);
+            c.SDL_BindGPUFragmentSamplers(
+                render_pass,
+                0,
+                &.{
+                    .texture = self.sprite_texture,
+                    .sampler = self.sprite_sampler,
+                },
+                1,
+            );
+            c.SDL_PushGPUVertexUniformData(cmd_buffer, 0, &sprite_matrix, @sizeOf(Matrix4x4));
+            c.SDL_DrawGPUPrimitives(render_pass, SPRITE_COUNT * 6, 1, 0, 0);
+
+            // Render text on top if we have any
+            if (geometry_data.vertex_count > 0) {
+                try self.renderText(render_pass, cmd_buffer, geometry_data, &text_matrices);
+            }
+
+            c.SDL_EndGPURenderPass(render_pass);
+        }
+
+        if (!c.SDL_SubmitGPUCommandBuffer(cmd_buffer)) {
+            return error.CommandBufferSubmissionFailed;
+        }
+    }
+
+    fn renderText(
+        self: *CombinedRenderer,
+        render_pass: *c.SDL_GPURenderPass,
+        cmd_buffer: *c.SDL_GPUCommandBuffer,
+        geometry_data: *GeometryData,
+        matrices: []const Mat4x4,
+    ) !void {
+        c.SDL_BindGPUGraphicsPipeline(render_pass, self.text_pipeline);
+        c.SDL_BindGPUVertexBuffers(
+            render_pass,
+            0,
+            &.{ .buffer = self.text_vertex_buffer, .offset = 0 },
+            1,
+        );
+        c.SDL_BindGPUIndexBuffer(
+            render_pass,
+            &.{ .buffer = self.text_index_buffer, .offset = 0 },
+            c.SDL_GPU_INDEXELEMENTSIZE_32BIT,
+        );
+        c.SDL_PushGPUVertexUniformData(
+            cmd_buffer,
+            0,
+            matrices.ptr,
+            @sizeOf(Mat4x4) * @as(u32, @intCast(matrices.len)),
+        );
+
+        // Get atlas texture from a temporary text object
+        var temp_str = "A".*;
+        const temp_text = c.TTF_CreateText(self.text_engine, self.font, &temp_str, 0);
+        defer c.TTF_DestroyText(temp_text);
+        const temp_sequence = c.TTF_GetGPUTextDrawData(temp_text);
+        const atlas_texture = temp_sequence.*.atlas_texture orelse {
+            return error.AtlasTextureRetrievalFailed;
+        };
+
+        c.SDL_BindGPUFragmentSamplers(
+            render_pass,
+            0,
+            &.{
+                .texture = atlas_texture,
+                .sampler = self.text_sampler,
+            },
+            1,
+        );
+        c.SDL_DrawGPUIndexedPrimitives(
+            render_pass,
+            @intCast(geometry_data.index_count),
+            1,
+            0,
+            0,
+            0,
+        );
+    }
+
+    fn uploadSpriteData(self: *CombinedRenderer, cmd_buffer: *c.SDL_GPUCommandBuffer) !void {
+        const raw_ptr = c.SDL_MapGPUTransferBuffer(
+            self.device,
+            self.sprite_data_transfer_buffer,
+            true,
+        ) orelse return error.SpriteDataBufferMappingFailed;
+
+        const sprite_data_ptr: [*]SpriteInstance = @ptrCast(@alignCast(raw_ptr));
+        updateSprites(sprite_data_ptr);
+        c.SDL_UnmapGPUTransferBuffer(self.device, self.sprite_data_transfer_buffer);
+
+        const copy_pass = c.SDL_BeginGPUCopyPass(cmd_buffer) orelse return error.CopyPassCreationFailed;
+        c.SDL_UploadToGPUBuffer(
+            copy_pass,
+            &.{
+                .transfer_buffer = self.sprite_data_transfer_buffer,
+                .offset = 0,
+            },
+            &.{
+                .buffer = self.sprite_data_buffer,
+                .offset = 0,
+                .size = SPRITE_COUNT * @sizeOf(SpriteInstance),
+            },
+            false,
+        );
+        c.SDL_EndGPUCopyPass(copy_pass);
+    }
+
+    fn uploadTextData(self: *CombinedRenderer, geometry_data: *GeometryData, cmd_buffer: *c.SDL_GPUCommandBuffer) !void {
         const transfer_data = c.SDL_MapGPUTransferBuffer(
             self.device,
-            self.transfer_buffer,
+            self.text_transfer_buffer,
             false,
         ) orelse {
-            return error.TransferBufferMappingFailed;
+            return error.TextTransferBufferMappingFailed;
         };
 
         const vertex_slice = geometry_data.vertices[0..@intCast(geometry_data.vertex_count)];
         const index_slice = geometry_data.indices[0..@intCast(geometry_data.index_count)];
 
-        const vertex_bytes_to_copy = @sizeOf(Vertex) * vertex_slice.len;
+        const vertex_bytes_to_copy = @sizeOf(TextVertex) * vertex_slice.len;
         const index_bytes_to_copy = @sizeOf(i32) * index_slice.len;
 
-        const index_buffer_offset_in_transfer_buffer = @sizeOf(Vertex) * MAX_VERTEX_COUNT;
+        const index_buffer_offset_in_transfer_buffer = @sizeOf(TextVertex) * MAX_VERTEX_COUNT;
         const dest_vertices_slice = @as([*]u8, @ptrCast(transfer_data))[0..vertex_bytes_to_copy];
         const dest_indices_ptr = @as([*]u8, @ptrCast(transfer_data)) + index_buffer_offset_in_transfer_buffer;
         const dest_indices_slice = dest_indices_ptr[0..index_bytes_to_copy];
@@ -210,24 +613,22 @@ const Context = struct {
         @memcpy(dest_vertices_slice, std.mem.sliceAsBytes(vertex_slice));
         @memcpy(dest_indices_slice, std.mem.sliceAsBytes(index_slice));
 
-        c.SDL_UnmapGPUTransferBuffer(self.device, self.transfer_buffer);
-    }
+        c.SDL_UnmapGPUTransferBuffer(self.device, self.text_transfer_buffer);
 
-    fn transferData(self: *Context, geometry_data: *GeometryData) !void {
-        const copy_pass = c.SDL_BeginGPUCopyPass(self.cmd_buf) orelse {
+        const copy_pass = c.SDL_BeginGPUCopyPass(cmd_buffer) orelse {
             return error.CopyPassStartFailed;
         };
 
         c.SDL_UploadToGPUBuffer(
             copy_pass,
             &.{
-                .transfer_buffer = self.transfer_buffer,
+                .transfer_buffer = self.text_transfer_buffer,
                 .offset = 0,
             },
             &.{
-                .buffer = self.vertex_buffer,
+                .buffer = self.text_vertex_buffer,
                 .offset = 0,
-                .size = @as(u32, @intCast(geometry_data.vertex_count)) * @sizeOf(Vertex),
+                .size = @as(u32, @intCast(geometry_data.vertex_count)) * @sizeOf(TextVertex),
             },
             false,
         );
@@ -235,11 +636,11 @@ const Context = struct {
         c.SDL_UploadToGPUBuffer(
             copy_pass,
             &.{
-                .transfer_buffer = self.transfer_buffer,
-                .offset = @sizeOf(Vertex) * MAX_VERTEX_COUNT,
+                .transfer_buffer = self.text_transfer_buffer,
+                .offset = @sizeOf(TextVertex) * MAX_VERTEX_COUNT,
             },
             &.{
-                .buffer = self.index_buffer,
+                .buffer = self.text_index_buffer,
                 .offset = 0,
                 .size = @as(u32, @intCast(geometry_data.index_count)) * @sizeOf(i32),
             },
@@ -249,204 +650,89 @@ const Context = struct {
         c.SDL_EndGPUCopyPass(copy_pass);
     }
 
-    fn draw(
-        self: *Context,
-        matrices: []Mat4x4,
-        num_matrices: i32,
-        draw_sequence: *c.TTF_GPUAtlasDrawSequence,
-    ) !void {
-        var swapchain_texture: ?*c.SDL_GPUTexture = null;
-
-        if (!c.SDL_WaitAndAcquireGPUSwapchainTexture(
-            self.cmd_buf,
-            self.window,
-            &swapchain_texture,
-            null,
-            null,
-        )) {
-            return error.SwapchainTextureAcquireFailed;
-        }
-
-        if (swapchain_texture != null) {
-            const color_target_info = c.SDL_GPUColorTargetInfo{
-                .texture = swapchain_texture,
-                .clear_color = .{ .r = 0.3, .g = 0.4, .b = 0.5, .a = 1.0 },
-                .load_op = c.SDL_GPU_LOADOP_CLEAR,
-                .store_op = c.SDL_GPU_STOREOP_STORE,
-            };
-            const render_pass = c.SDL_BeginGPURenderPass(
-                self.cmd_buf,
-                &color_target_info,
-                1,
-                null,
-            ) orelse {
-                return error.RenderPassStartFailed;
-            };
-
-            c.SDL_BindGPUGraphicsPipeline(render_pass, self.pipeline);
-            c.SDL_BindGPUVertexBuffers(
-                render_pass,
-                0,
-                &.{ .buffer = self.vertex_buffer, .offset = 0 },
-                1,
-            );
-            c.SDL_BindGPUIndexBuffer(
-                render_pass,
-                &.{ .buffer = self.index_buffer, .offset = 0 },
-                c.SDL_GPU_INDEXELEMENTSIZE_32BIT,
-            );
-            c.SDL_PushGPUVertexUniformData(
-                self.cmd_buf,
-                0,
-                matrices.ptr,
-                @sizeOf(Mat4x4) * @as(u32, @intCast(num_matrices)),
-            );
-
-            const index_offsert: i32 = 0;
-            const vertex_offset: i32 = 0;
-            var seq: ?*c.TTF_GPUAtlasDrawSequence = draw_sequence;
-            while (seq != null) : (seq = seq.?.next) {
-                c.SDL_BindGPUFragmentSamplers(
-                    render_pass,
-                    0,
-                    &.{
-                        .texture = seq.?.atlas_texture,
-                        .sampler = self.sampler,
-                    },
-                    1,
-                );
-                c.SDL_DrawGPUIndexedPrimitives(
-                    render_pass,
-                    @intCast(seq.?.num_indices),
-                    1,
-                    index_offsert,
-                    vertex_offset,
-                    0,
-                );
-            }
-
-            c.SDL_EndGPURenderPass(render_pass);
-        }
-    }
-
-    fn drawBatchedText(
-        self: *Context,
-        matrices: []Mat4x4,
-        num_matrices: i32,
-        geometry_data: *GeometryData,
-        atlas_texture: *c.SDL_GPUTexture,
-    ) !void {
-        var swapchain_texture: ?*c.SDL_GPUTexture = null;
-
-        if (!c.SDL_WaitAndAcquireGPUSwapchainTexture(self.cmd_buf, self.window, &swapchain_texture, null, null)) {
-            return error.SwapchainTextureAcquireFailed;
-        }
-
-        if (swapchain_texture != null) {
-            const color_target_info = c.SDL_GPUColorTargetInfo{
-                .texture = swapchain_texture,
-                .clear_color = .{ .r = 0.3, .g = 0.4, .b = 0.5, .a = 1.0 },
-                .load_op = c.SDL_GPU_LOADOP_CLEAR,
-                .store_op = c.SDL_GPU_STOREOP_STORE,
-            };
-            const render_pass = c.SDL_BeginGPURenderPass(
-                self.cmd_buf,
-                &color_target_info,
-                1,
-                null,
-            ) orelse {
-                return error.RenderPassStartFailed;
-            };
-
-            c.SDL_BindGPUGraphicsPipeline(render_pass, self.pipeline);
-            c.SDL_BindGPUVertexBuffers(
-                render_pass,
-                0,
-                &.{ .buffer = self.vertex_buffer, .offset = 0 },
-                1,
-            );
-            c.SDL_BindGPUIndexBuffer(
-                render_pass,
-                &.{ .buffer = self.index_buffer, .offset = 0 },
-                c.SDL_GPU_INDEXELEMENTSIZE_32BIT,
-            );
-            c.SDL_PushGPUVertexUniformData(self.cmd_buf, 0, matrices.ptr, @sizeOf(Mat4x4) * @as(u32, @intCast(num_matrices)));
-
-            c.SDL_BindGPUFragmentSamplers(
-                render_pass,
-                0,
-                &.{
-                    .texture = atlas_texture,
-                    .sampler = self.sampler,
-                },
-                1,
-            );
-            c.SDL_DrawGPUIndexedPrimitives(
-                render_pass,
-                @intCast(geometry_data.index_count),
-                1,
-                0,
-                0,
-                0,
-            );
-
-            c.SDL_EndGPURenderPass(render_pass);
-        }
-    }
-
-    fn deinit(self: *Context) void {
+    fn deinit(self: *CombinedRenderer) void {
         _ = c.SDL_WaitForGPUIdle(self.device);
-        c.SDL_ReleaseGPUTransferBuffer(self.device, self.transfer_buffer);
-        c.SDL_ReleaseGPUSampler(self.device, self.sampler);
-        c.SDL_ReleaseGPUBuffer(self.device, self.vertex_buffer);
-        c.SDL_ReleaseGPUBuffer(self.device, self.index_buffer);
-        c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.pipeline);
+        
+        // Cleanup text resources
+        c.TTF_DestroyGPUTextEngine(self.text_engine);
+        c.TTF_CloseFont(self.font);
+        c.SDL_ReleaseGPUTransferBuffer(self.device, self.text_transfer_buffer);
+        c.SDL_ReleaseGPUSampler(self.device, self.text_sampler);
+        c.SDL_ReleaseGPUBuffer(self.device, self.text_vertex_buffer);
+        c.SDL_ReleaseGPUBuffer(self.device, self.text_index_buffer);
+        c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.text_pipeline);
+        
+        // Cleanup sprite resources
+        c.SDL_ReleaseGPUBuffer(self.device, self.sprite_data_buffer);
+        c.SDL_ReleaseGPUTransferBuffer(self.device, self.sprite_data_transfer_buffer);
+        c.SDL_ReleaseGPUSampler(self.device, self.sprite_sampler);
+        c.SDL_ReleaseGPUTexture(self.device, self.sprite_texture);
+        c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.sprite_pipeline);
+        
+        // Cleanup common resources
         c.SDL_ReleaseWindowFromGPUDevice(self.device, self.window);
         c.SDL_DestroyGPUDevice(self.device);
         c.SDL_DestroyWindow(self.window);
     }
 };
 
-const GeometryData = struct {
-    vertices: []Vertex,
-    vertex_count: i32,
-    indices: []i32,
-    index_count: i32,
+// Helper functions from the original files
+fn createOrtographicOffCenter(
+    left: f32,
+    right: f32,
+    bottom: f32,
+    top: f32,
+    z_near_plane: f32,
+    z_far_plane: f32,
+) Matrix4x4 {
+    return .{
+        .{ 2 / (right - left), 0, 0, 0 },
+        .{ 0, 2 / (top - bottom), 0, 0 },
+        .{ 0, 0, 1.0 / (z_near_plane - z_far_plane), 0 },
+        .{
+            (left + right) / (left - right),
+            (top + bottom) / (bottom - top),
+            z_near_plane / (z_near_plane - z_far_plane),
+            1,
+        },
+    };
+}
 
-    fn queueTextSequence(
-        self: *GeometryData,
-        sequence: *const c.TTF_GPUAtlasDrawSequence,
-        color: *const Color,
-    ) !void {
-        var i: i32 = 0;
-        while (i < sequence.num_vertices) : (i += 1) {
-            const idx: usize = @intCast(i);
-            const pos = sequence.xy[idx];
-            const vert = Vertex{
-                .pos = .{ .x = pos.x, .y = pos.y, .z = 0.0 },
-                .color = color.*,
-                .uv = sequence.uv[idx],
-            };
-            self.vertices[@intCast(self.vertex_count + i)] = vert;
-        }
+fn loadImage(image_filename: []const u8, desired_channels: u32) !*c.SDL_Surface {
+    var full_path_buf: [256]u8 = undefined;
+    const full_path = try std.fmt.bufPrintZ(
+        &full_path_buf,
+        "{s}{s}",
+        .{ IMAGES_BASE_PATH, image_filename },
+    );
 
-        const new_indices = self.indices[@intCast(self.index_count)..];
-        const sequence_indices = sequence.indices[0..@intCast(sequence.num_indices)];
-        @memcpy(new_indices[0..sequence_indices.len], sequence_indices);
+    const result = c.SDL_LoadBMP(full_path.ptr) orelse {
+        c.SDL_Log("Failed to load BMP: %s", c.SDL_GetError());
+        return error.LoadBMPFailed;
+    };
+    errdefer c.SDL_DestroySurface(result);
 
-        self.vertex_count += sequence.num_vertices;
-        self.index_count += sequence.num_indices;
+    const format = switch (desired_channels) {
+        4 => c.SDL_PIXELFORMAT_ABGR8888,
+        else => {
+            c.SDL_Log("Unexpected desired_channels: %d", desired_channels);
+            return error.UnsupportedChannelCount;
+        },
+    };
+
+    if (result.*.format != format) {
+        const converted = c.SDL_ConvertSurface(result, format) orelse {
+            c.SDL_Log("Failed to convert surface: %s", c.SDL_GetError());
+            return error.SurfaceConversionFailed;
+        };
+        c.SDL_DestroySurface(result);
+        return converted;
     }
 
-    fn queueText(self: *GeometryData, sequence: *c.TTF_GPUAtlasDrawSequence, color: *const Color) !void {
-        var current: ?*c.TTF_GPUAtlasDrawSequence = sequence;
-        while (current != null) : (current = current.?.next) {
-            try self.queueTextSequence(current.?, color);
-        }
-    }
-};
+    return result;
+}
 
-pub fn loadShader(
+fn loadShader(
     device: *c.SDL_GPUDevice,
     shader_name: []const u8,
     sampler_count: u32,
@@ -496,7 +782,6 @@ pub fn loadShader(
         c.SDL_Log("Failed to load shader file: %s", shader_path.ptr);
         return error.ShaderFileLoadFailed;
     };
-    c.SDL_Log("Loaded shader file: %s, size: %zu bytes", shader_path.ptr, code_size);
     defer c.SDL_free(code);
 
     return c.SDL_CreateGPUShader(device, &.{
@@ -512,6 +797,128 @@ pub fn loadShader(
     }) orelse {
         return error.ShaderCreationFailed;
     };
+}
+
+fn setupTextureData(device: *c.SDL_GPUDevice) !struct { texture: *c.SDL_GPUTexture, sampler: *c.SDL_GPUSampler } {
+    const image_data = try loadImage("ravioli_atlas.bmp", 4);
+    defer c.SDL_DestroySurface(image_data);
+
+    const texture_transfer_buffer = c.SDL_CreateGPUTransferBuffer(
+        device,
+        &.{
+            .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+            .size = @intCast(image_data.*.pitch * image_data.*.h),
+        },
+    ) orelse return error.TransferBufferCreationFailed;
+    defer c.SDL_ReleaseGPUTransferBuffer(device, texture_transfer_buffer);
+
+    const texture_transfer_ptr = c.SDL_MapGPUTransferBuffer(
+        device,
+        texture_transfer_buffer,
+        false,
+    ) orelse return error.TransferBufferMappingFailed;
+
+    _ = c.SDL_memcpy(texture_transfer_ptr, image_data.pixels, @intCast(image_data.w * image_data.h * 4));
+    c.SDL_UnmapGPUTransferBuffer(device, texture_transfer_buffer);
+
+    const texture = c.SDL_CreateGPUTexture(
+        device,
+        &.{
+            .type = c.SDL_GPU_TEXTURETYPE_2D,
+            .format = c.SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+            .width = @intCast(image_data.w),
+            .height = @intCast(image_data.h),
+            .layer_count_or_depth = 1,
+            .num_levels = 1,
+            .usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+        },
+    ) orelse return error.TextureCreationFailed;
+
+    const sampler = c.SDL_CreateGPUSampler(
+        device,
+        &.{
+            .min_filter = c.SDL_GPU_FILTER_NEAREST,
+            .mag_filter = c.SDL_GPU_FILTER_NEAREST,
+            .mipmap_mode = c.SDL_GPU_FILTER_NEAREST,
+            .address_mode_u = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+            .address_mode_v = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+            .address_mode_w = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        },
+    ) orelse return error.SamplerCreationFailed;
+
+    const upload_cmd_buf = c.SDL_AcquireGPUCommandBuffer(device) orelse
+        return error.CommandBufferAcquisitionFailed;
+
+    const copy_pass = c.SDL_BeginGPUCopyPass(upload_cmd_buf) orelse
+        return error.CopyPassCreationFailed;
+
+    c.SDL_UploadToGPUTexture(
+        copy_pass,
+        &.{
+            .transfer_buffer = texture_transfer_buffer,
+            .offset = 0,
+        },
+        &.{
+            .texture = texture,
+            .w = @intCast(image_data.w),
+            .h = @intCast(image_data.h),
+            .d = 1,
+        },
+        false,
+    );
+
+    c.SDL_EndGPUCopyPass(copy_pass);
+    _ = c.SDL_SubmitGPUCommandBuffer(upload_cmd_buf);
+
+    return .{ .texture = texture, .sampler = sampler };
+}
+
+fn setupSpriteBuffers(device: *c.SDL_GPUDevice) !struct { transfer_buffer: *c.SDL_GPUTransferBuffer, storage_buffer: *c.SDL_GPUBuffer } {
+    const sprite_data_transfer_buffer = c.SDL_CreateGPUTransferBuffer(
+        device,
+        &.{
+            .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+            .size = SPRITE_COUNT * @sizeOf(SpriteInstance),
+        },
+    ) orelse return error.SpriteDataTransferBufferCreationFailed;
+
+    const sprite_data_buffer = c.SDL_CreateGPUBuffer(
+        device,
+        &.{
+            .usage = c.SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ,
+            .size = SPRITE_COUNT * @sizeOf(SpriteInstance),
+        },
+    ) orelse return error.SpriteDataBufferCreationFailed;
+
+    return .{
+        .transfer_buffer = sprite_data_transfer_buffer,
+        .storage_buffer = sprite_data_buffer,
+    };
+}
+
+fn updateSprites(sprite_data: [*]SpriteInstance) void {
+    var i: u32 = 0;
+    while (i < SPRITE_COUNT) : (i += 1) {
+        const ravioli = c.SDL_rand(4);
+        sprite_data[i] = .{
+            .x = @floatFromInt(c.SDL_rand(800)),
+            .y = @floatFromInt(c.SDL_rand(600)),
+            .z = 0,
+            .rotation = c.SDL_randf() * c.SDL_PI_F * 2,
+            .w = 64,
+            .h = 64,
+            .tex_u = CombinedRenderer.u_coords[@intCast(ravioli)],
+            .tex_v = CombinedRenderer.v_coords[@intCast(ravioli)],
+            .tex_w = 0.5,
+            .tex_h = 0.5,
+            .r = 1.0,
+            .g = 1.0,
+            .b = 1.0,
+            .a = 1.0,
+            .padding_a = 0,
+            .padding_b = 0,
+        };
+    }
 }
 
 fn renderTextToGeometry(
@@ -541,7 +948,7 @@ fn renderTextToGeometry(
     while (i < sequence.*.num_vertices) : (i += 1) {
         const idx: usize = @intCast(i);
         const pos = sequence.*.xy[idx];
-        const vert = Vertex{
+        const vert = TextVertex{
             .pos = .{ .x = pos.x + x, .y = pos.y + y, .z = 0.0 },
             .color = color,
             .uv = sequence.*.uv[idx],
@@ -575,8 +982,6 @@ pub fn main() !void {
     while (i < args.len) : (i += 1) {
         if (std.ascii.eqlIgnoreCase(args[i], "--sdf")) {
             use_sdf = true;
-        } else if (args[i][0] == '-') {
-            break;
         }
     }
 
@@ -594,14 +999,13 @@ pub fn main() !void {
     }
     defer c.TTF_Quit();
 
-    var running = true;
+    var renderer = try CombinedRenderer.init(use_sdf, font_filename);
+    defer renderer.deinit();
 
-    var context = try Context.init(use_sdf);
-    defer context.deinit();
+    _ = c.SDL_ShowWindow(renderer.window);
 
-    _ = c.SDL_ShowWindow(context.window);
-
-    const vertices = try allocator.alloc(Vertex, MAX_VERTEX_COUNT);
+    // Setup text geometry data
+    const vertices = try allocator.alloc(TextVertex, MAX_VERTEX_COUNT);
     defer allocator.free(vertices);
 
     const indices = try allocator.alloc(i32, MAX_INDEX_COUNT);
@@ -614,49 +1018,20 @@ pub fn main() !void {
         .index_count = 0,
     };
 
-    const font = c.TTF_OpenFont(font_filename.ptr, 50) orelse {
-        c.SDL_Log("Failed to open font: %s", c.SDL_GetError());
-        return error.FontLoadingFailed;
-    };
-    defer c.TTF_CloseFont(font);
-
-    if (!c.TTF_SetFontSDF(font, use_sdf)) {
-        c.SDL_Log("Failed to set font SDF mode: %s", c.SDL_GetError());
-        return error.FontSDFSettingFailed;
-    }
-    c.TTF_SetFontWrapAlignment(font, c.TTF_HORIZONTAL_ALIGN_CENTER);
-
-    const engine = c.TTF_CreateGPUTextEngine(context.device) orelse {
-        c.SDL_Log("Failed to create GPU text engine: %s", c.SDL_GetError());
-        return error.GPUTextEngineCreationFailed;
-    };
-
-    defer {
-        _ = c.SDL_WaitForGPUIdle(context.device);
-        c.TTF_DestroyGPUTextEngine(engine);
-    }
-
-    var str = "Hello, SDL GPU Text!".*;
-    const text = c.TTF_CreateText(engine, font, &str, 0);
-    defer c.TTF_DestroyText(text);
-
-    const color = Color{ .r = 1.0, .g = 1.0, .b = 0.0, .a = 1.0 };
     const white_color = Color{ .r = 1.0, .g = 1.0, .b = 1.0, .a = 1.0 };
     const red_color = Color{ .r = 1.0, .g = 0.0, .b = 0.0, .a = 1.0 };
+    var fps_counter = FPSCounter.init();
 
-    var matrices = [_]Mat4x4{
-        Mat4x4.ortho(0.0, 800.0, 0.0, 600.0, -1.0, 1.0),
-        Mat4x4.identity(),
-    };
-
+    var running = true;
     while (running) {
+        fps_counter.update();
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event)) {
             switch (event.type) {
                 c.SDL_EVENT_KEY_DOWN => {
                     const key = event.key.key;
                     switch (key) {
-                        c.SDLK_ESCAPE => {
+                        c.SDLK_ESCAPE, c.SDLK_Q => {
                             running = false;
                         },
                         else => {},
@@ -669,40 +1044,15 @@ pub fn main() !void {
             }
         }
 
-        geometry_data.vertex_count = 0;
-        geometry_data.index_count = 0;
+        // Reset text geometry for this frame
+        geometry_data.reset();
 
-        try renderTextToGeometry(engine, font, "Hello, World!", 100.0, 50.0, color, &geometry_data);
-        try renderTextToGeometry(engine, font, "SDL GPU Text", 200.0, 150.0, white_color, &geometry_data);
-        try renderTextToGeometry(engine, font, "UI Rendering", 150.0, 250.0, red_color, &geometry_data);
+        // Add text to render
+        try renderTextToGeometry(renderer.text_engine, renderer.font, "Sprites + Text!", 0.0, 600.0, white_color, &geometry_data);
+        try renderTextToGeometry(renderer.text_engine, renderer.font, "Combined Rendering", 0.0, 550.0, white_color, &geometry_data);
+        try renderTextToGeometry(renderer.text_engine, renderer.font, fps_counter.toString(), 0.0, 500.0, red_color, &geometry_data);
 
-        _ = try renderTextToGeometry(engine, font, "Frame-based UI", 50.0, 350.0, white_color, &geometry_data);
-
-        if (geometry_data.vertex_count > 0) {
-            try context.setGeometryData(&geometry_data);
-
-            context.cmd_buf = c.SDL_AcquireGPUCommandBuffer(context.device) orelse {
-                c.SDL_Log("Failed to acquire command buffer: %s", c.SDL_GetError());
-                return error.CommandBufferAcquisitionFailed;
-            };
-
-            try context.transferData(&geometry_data);
-
-            var temp_str = "A".*;
-            const temp_text = c.TTF_CreateText(engine, font, &temp_str, 0);
-            const temp_sequence = c.TTF_GetGPUTextDrawData(temp_text);
-            const atlas_texture = temp_sequence.*.atlas_texture orelse {
-                c.SDL_Log("Failed to get atlas texture from text: %s", c.SDL_GetError());
-                return error.AtlasTextureRetrievalFailed;
-            };
-            c.TTF_DestroyText(temp_text);
-
-            try context.drawBatchedText(&matrices, 2, &geometry_data, atlas_texture);
-
-            if (!c.SDL_SubmitGPUCommandBuffer(context.cmd_buf)) {
-                c.SDL_Log("Failed to submit command buffer: %s", c.SDL_GetError());
-                return error.CommandBufferSubmissionFailed;
-            }
-        }
+        // Render both sprites and text
+        try renderer.render(&geometry_data);
     }
 }
